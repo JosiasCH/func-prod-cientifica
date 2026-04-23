@@ -29,7 +29,6 @@ def get_sql_connection_string() -> str:
 
 def get_blob_service():
     from azure.storage.blob import BlobServiceClient
-
     conn_str = get_env("DATA_STORAGE_CONNECTION_STRING")
     return BlobServiceClient.from_connection_string(conn_str)
 
@@ -980,6 +979,7 @@ def match_scopus_author_to_docente(
         alias_key="strong_aliases",
         career_hint=career_hint
     )
+
     if strong_match["matched"]:
         return {
             "matched": True,
@@ -987,6 +987,7 @@ def match_scopus_author_to_docente(
             "match_method": "DOCENTES_REF_ALIAS_STRONG",
             "docente": strong_match["docente"],
         }
+
     if strong_match["ambiguous"]:
         return {
             "matched": False,
@@ -1004,7 +1005,7 @@ def match_scopus_author_to_docente(
 
 
 # =========================
-# AFFILIATION-FIRST ENRICHMENT
+# AFFILIATION-FIRST + AUTHOR FALLBACK
 # =========================
 def unique_keep_order(items: list[str]) -> list[str]:
     seen = set()
@@ -1033,7 +1034,6 @@ def get_block_engineering_careers(
     if block_careers:
         return block_careers
 
-    # fallback solo si la afiliación global ULima trae una sola carrera explícita
     if len(publication_level_careers) == 1:
         return publication_level_careers
 
@@ -1060,25 +1060,20 @@ def enrich_ulima_fields_from_ref(
     publication_careers: list[str] = []
     first_author_ulima = False
     matched_any = False
-    affiliation_engineering_detected = False
+    affiliation_ulima_detected = False
 
     for idx, block in enumerate(author_blocks):
         if not is_ulima_text(block):
             continue
+
+        affiliation_ulima_detected = True
 
         block_careers = get_block_engineering_careers(
             block_value=block,
             publication_level_careers=publication_level_careers,
         )
 
-        # Solo consideramos Ingeniería si la afiliación lo dice explícitamente
-        if not block_careers:
-            continue
-
-        affiliation_engineering_detected = True
-        publication_careers.extend(block_careers)
-
-        if idx == 0:
+        if idx == 0 and block_careers:
             first_author_ulima = True
 
         if idx < len(full_authors):
@@ -1088,13 +1083,14 @@ def enrich_ulima_fields_from_ref(
         else:
             scopus_author_name = block.split(",", 2)[0].strip()
 
-        # career_hint solo si el bloque resolvió una sola carrera
-        career_hint = block_careers[0] if len(block_careers) == 1 else None
+        # Paso 1: carrera por afiliación
+        resolved_career_hint = block_careers[0] if len(block_careers) == 1 else None
 
+        # Paso 2: si afiliación no resolvió carrera, fallback con docente normalizado
         match_result = match_scopus_author_to_docente(
             scopus_author_name=scopus_author_name,
             docentes_ref=docentes_ref,
-            career_hint=career_hint,
+            career_hint=resolved_career_hint
         )
 
         if match_result["matched"]:
@@ -1105,18 +1101,22 @@ def enrich_ulima_fields_from_ref(
             if display_name and display_name not in matched_docentes:
                 matched_docentes.append(display_name)
 
-    # Si no hubo bloques útiles, pero la afiliación global sí dice carrera ULima Ingeniería,
-    # igual llenamos carrera_raw a nivel publicación
+            if not block_careers and docente.get("carrera"):
+                block_careers = [docente.get("carrera")]
+
+        publication_careers.extend(block_careers)
+
     if not publication_careers and publication_level_careers:
         publication_careers.extend(publication_level_careers)
-        affiliation_engineering_detected = True
 
-    publication_careers = unique_keep_order(publication_careers)
+    publication_careers = unique_keep_order([c for c in publication_careers if c])
 
     if matched_any and publication_careers:
         metodo = "AFFILIATION+DOCENTES_REF"
     elif publication_careers:
         metodo = "AFFILIATION_ONLY"
+    elif matched_any:
+        metodo = "DOCENTES_REF_ONLY"
     else:
         metodo = None
 
@@ -1125,7 +1125,7 @@ def enrich_ulima_fields_from_ref(
         "first_author_ulima_raw": "True" if first_author_ulima else "False",
         "carrera_raw": "; ".join(publication_careers) if publication_careers else None,
         "metodo_cruce_scopus_raw": metodo,
-        "es_ulima_raw_detected": affiliation_engineering_detected,
+        "es_ulima_raw_detected": affiliation_ulima_detected,
     }
 
 

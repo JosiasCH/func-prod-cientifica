@@ -4,6 +4,8 @@ import io
 import json
 import logging
 import os
+import re
+import unicodedata
 from datetime import datetime, timezone
 
 import azure.functions as func
@@ -46,6 +48,128 @@ def safe_get(row: dict, aliases: list[str]) -> str | None:
 def compute_record_hash(eid: str | None, doi: str | None, title: str | None) -> str:
     raw = f"{eid or ''}|{doi or ''}|{title or ''}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+# =========================
+# ULIMA / CAREER ENRICHMENT
+# =========================
+ULIMA_PATTERNS = [
+    "universidad de lima",
+    "university of lima",
+]
+
+CAREER_PATTERNS = {
+    "Ingeniería Industrial": [
+        "carrera de ingenieria industrial",
+        "industrial engineering career",
+        "ingenieria industrial",
+        "industrial engineering",
+    ],
+    "Ingeniería de Sistemas": [
+        "carrera de ingenieria de sistemas",
+        "systems engineering career",
+        "ingenieria de sistemas",
+        "ingenieria de sistemas computacionales",
+        "systems engineering",
+        "computer systems engineering",
+    ],
+    "Ingeniería Civil": [
+        "carrera de ingenieria civil",
+        "civil engineering career",
+        "ingenieria civil",
+        "civil engineering",
+    ],
+}
+
+
+def normalize_text(value: str | None) -> str:
+    if not value:
+        return ""
+
+    value = value.lower()
+    value = value.replace("\\", " ")
+    value = value.replace("–", " ").replace("—", " ")
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def split_semicolon_values(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in str(value).split(";") if part.strip()]
+
+
+def clean_author_full_name(value: str) -> str:
+    value = re.sub(r"\s*\(\d+\)\s*$", "", value).strip()
+    return value
+
+
+def extract_author_name_from_block(block: str) -> str:
+    return block.split(",", 1)[0].strip()
+
+
+def is_ulima_text(value: str | None) -> bool:
+    norm = normalize_text(value)
+    return any(pattern in norm for pattern in ULIMA_PATTERNS)
+
+
+def infer_career_from_text(value: str | None) -> str | None:
+    norm = normalize_text(value)
+
+    for career, patterns in CAREER_PATTERNS.items():
+        if any(pattern in norm for pattern in patterns):
+            return career
+
+    return None
+
+
+def enrich_ulima_fields(
+    authors_value: str | None,
+    author_full_names_value: str | None,
+    authors_with_affiliations_value: str | None,
+    affiliations_value: str | None,
+) -> dict:
+    short_authors = split_semicolon_values(authors_value)
+    full_authors = [clean_author_full_name(x) for x in split_semicolon_values(author_full_names_value)]
+    author_blocks = split_semicolon_values(authors_with_affiliations_value)
+
+    ulima_authors: list[str] = []
+    careers: list[str] = []
+    first_author_ulima = False
+
+    if author_blocks:
+        for idx, block in enumerate(author_blocks):
+            if is_ulima_text(block):
+                if idx == 0:
+                    first_author_ulima = True
+
+                if idx < len(full_authors):
+                    author_name = full_authors[idx]
+                elif idx < len(short_authors):
+                    author_name = short_authors[idx]
+                else:
+                    author_name = extract_author_name_from_block(block)
+
+                if author_name and author_name not in ulima_authors:
+                    ulima_authors.append(author_name)
+
+                detected_career = infer_career_from_text(block)
+                if detected_career and detected_career not in careers:
+                    careers.append(detected_career)
+
+    # fallback débil a affiliations globales si no hubo carrera por bloque autor-afiliación
+    if not careers and is_ulima_text(affiliations_value):
+        detected_career = infer_career_from_text(affiliations_value)
+        if detected_career:
+            careers.append(detected_career)
+
+    return {
+        "ulima_docentes_raw": "; ".join(ulima_authors) if ulima_authors else None,
+        "first_author_ulima_raw": "True" if first_author_ulima else "False",
+        "carrera_raw": "; ".join(careers) if careers else None,
+    }
 
 
 # =========================
@@ -217,22 +341,19 @@ COLUMN_ALIASES = {
     "eid": ["EID", "eid"],
     "publication_year_raw": ["Year", "Año"],
     "scopus_year_raw": ["Año (Scopus)", "Scopus Year", "Year"],
-    "publication_type_raw": ["Tipo de publicación", "Document Type", "Type"],
-    "publication_title_raw": ["Título de la publicación", "Title", "Publication Title"],
-    "authors_raw": ["Autor(es)", "Authors"],
-    "ulima_docentes_raw": ["Autor(es) Ulima Docentes", "Author(es) Ulima Docentes"],
-    "ulima_estudiantes_raw": ["Autor(es) Ulima estudiantes", "Author(es) Ulima students"],
-    "first_author_ulima_raw": ["Primer autor ulima", "First Author Ulima"],
+    "publication_type_raw": ["Tipo de publicación", "Document Type", "Source & document type", "Document Type (Scopus)"],
+    "publication_title_raw": ["Título de la publicación", "Title", "Publication Title", "Document title"],
+    "authors_raw": ["Authors", "Autor(es)", "Author(s)"],
     "conference_journal_raw": ["Conferencia/Journal", "Conference/Journal", "Conference Journal"],
     "indexation_raw": ["Indexación", "Indexation"],
     "editorial_publication_raw": ["Editorial de publicación", "Publisher"],
     "doi_link_raw": ["DOI /link", "DOI"],
     "publication_date_raw": ["Fecha de publicacion", "Publication date", "Date"],
     "publication_date_scopus_raw": ["Fecha de publicacion (Scopus)"],
-    "revista_raw": ["Revista", "Source title"],
+    "revista_raw": ["Revista", "Source title", "Source Title"],
     "conference_raw": ["Conferencia", "Conference name"],
     "publication_status_raw": ["Estado publicación", "Publication Stage", "Publication Status"],
-    "issn_raw": ["ISSN"],
+    "issn_raw": ["ISSN", "Serial identifiers (e.g. ISSN)"],
     "isbn_raw": ["ISBN"],
     "scopus_link_raw": ["Link SCOPUS", "Link"],
     "alternative_link_raw": ["LINK REVISTA (ALTERNATIVO)", "Alternative Link"],
@@ -247,7 +368,7 @@ COLUMN_ALIASES = {
     "abstract_scopus_raw": ["Abstract Scopus", "Abstract"],
     "author_keywords_raw": ["Author keywords", "Author Keywords"],
     "index_keywords_raw": ["Index keywords", "Index Keywords"],
-    "source_title_raw": ["Source title"],
+    "source_title_raw": ["Source title", "Source Title"],
     "document_type_scopus_raw": ["Document Type (Scopus)", "Document Type"],
     "affiliation_raw": ["Afiliaciones", "Affiliations", "Authors with affiliations"],
 }
@@ -255,8 +376,40 @@ COLUMN_ALIASES = {
 
 def map_row_to_staging(row: dict) -> dict:
     mapped = {}
+
     for target_column, aliases in COLUMN_ALIASES.items():
         mapped[target_column] = safe_get(row, aliases)
+
+    authors_value = safe_get(row, ["Authors", "Author(s)", "Autor(es)"])
+    author_full_names_value = safe_get(row, ["Author full names"])
+    authors_with_affiliations_value = safe_get(row, ["Authors with affiliations"])
+    affiliations_value = safe_get(row, ["Affiliations", "Afiliaciones"])
+
+    enrichment = enrich_ulima_fields(
+        authors_value=authors_value,
+        author_full_names_value=author_full_names_value,
+        authors_with_affiliations_value=authors_with_affiliations_value,
+        affiliations_value=affiliations_value,
+    )
+
+    mapped["authors_raw"] = authors_value or mapped.get("authors_raw")
+    mapped["affiliation_raw"] = affiliations_value or mapped.get("affiliation_raw")
+    mapped["ulima_docentes_raw"] = enrichment["ulima_docentes_raw"]
+    mapped["first_author_ulima_raw"] = enrichment["first_author_ulima_raw"]
+
+    if enrichment["carrera_raw"]:
+        mapped["carrera_raw"] = enrichment["carrera_raw"]
+
+    if not mapped.get("indexation_raw"):
+        mapped["indexation_raw"] = "Scopus"
+
+    if not mapped.get("es_scopus_raw"):
+        mapped["es_scopus_raw"] = "True"
+
+    if enrichment["ulima_docentes_raw"]:
+        mapped["metodo_cruce_scopus_raw"] = "AUTHORS_WITH_AFFILIATIONS"
+    elif mapped.get("eid") and not mapped.get("metodo_cruce_scopus_raw"):
+        mapped["metodo_cruce_scopus_raw"] = "EID"
 
     record_hash = compute_record_hash(
         mapped.get("eid"),

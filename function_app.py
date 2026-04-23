@@ -15,25 +15,13 @@ def get_env(name: str) -> str:
     return value
 
 
-def build_sql_connection_string() -> str:
-    server = get_env("SQL_SERVER")
-    database = get_env("SQL_DATABASE")
-    username = get_env("SQL_USERNAME")
-    password = get_env("SQL_PASSWORD")
-
-    return (
-        f"Server={server};"
-        f"Database={database};"
-        f"User Id={username};"
-        f"Password={password};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=no;"
-        "Connection Timeout=30;"
-    )
+def get_sql_connection_string() -> str:
+    return get_env("SQL_CONNECTION_STRING")
 
 
 def get_blob_service():
     from azure.storage.blob import BlobServiceClient
+
     conn_str = get_env("DATA_STORAGE_CONNECTION_STRING")
     return BlobServiceClient.from_connection_string(conn_str)
 
@@ -52,14 +40,19 @@ def validate_containers() -> dict:
     }
 
 
-def insert_pipeline_run(trigger_type: str, status: str, source_name: str = "FUNCTION_SMOKE") -> int:
+def insert_pipeline_run(
+    trigger_type: str,
+    status: str,
+    source_name: str = "FUNCTION_SMOKE"
+) -> int:
     from mssql_python import connect
 
     pipeline_name = os.environ.get("PIPELINE_NAME", "scopus_monthly_pipeline")
-    sql_conn_str = build_sql_connection_string()
+    sql_conn_str = get_sql_connection_string()
 
     with connect(sql_conn_str) as conn:
         cursor = conn.cursor()
+
         cursor.execute(
             """
             INSERT INTO meta.pipeline_runs (
@@ -91,7 +84,9 @@ def insert_pipeline_run(trigger_type: str, status: str, source_name: str = "FUNC
         )
         conn.commit()
 
-        cursor.execute("SELECT TOP 1 run_id FROM meta.pipeline_runs ORDER BY run_id DESC")
+        cursor.execute(
+            "SELECT TOP 1 run_id FROM meta.pipeline_runs ORDER BY run_id DESC"
+        )
         row = cursor.fetchone()
         cursor.close()
 
@@ -125,13 +120,20 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as exc:
         logging.exception("Health check failed")
         return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "status": "error",
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             status_code=500,
             mimetype="application/json",
         )
 
 
-@app.route(route="run-smoke", methods=["POST", "GET"])
+@app.route(route="run-smoke", methods=["GET", "POST"])
 def run_smoke(req: func.HttpRequest) -> func.HttpResponse:
     try:
         container_status = validate_containers()
@@ -154,7 +156,14 @@ def run_smoke(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as exc:
         logging.exception("Smoke run failed")
         return func.HttpResponse(
-            json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "status": "error",
+                    "message": str(exc),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             status_code=500,
             mimetype="application/json",
         )

@@ -8,6 +8,9 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 
+import re
+import unicodedata
+
 import azure.functions as func
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
@@ -560,6 +563,449 @@ def insert_rows_to_staging(run_id: int, source_file_name: str, rows: list[dict])
 
 
 # =========================
+# DOCENTES INGESTION
+# =========================
+DOCENTES_SHEET_CAREERS = {
+    "Civil": "Ingeniería Civil",
+    "Industrial": "Ingeniería Industrial",
+    "Sistemas": "Ingeniería de Sistemas",
+}
+
+
+def normalize_generic_text(value: str | None) -> str:
+    if not value:
+        return ""
+
+    value = str(value).lower().strip()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(ch for ch in value if not unicodedata.combining(ch))
+    value = value.replace("\\", " ").replace("/", " / ")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def normalize_docente_name(value: str | None) -> str:
+    if not value:
+        return ""
+    norm = normalize_generic_text(value)
+    norm = norm.replace("/", " ")
+    norm = re.sub(r"\s+", " ", norm).strip()
+    return norm
+
+
+def to_title_or_none(value: str | None) -> str | None:
+    if not value:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    return value.title()
+
+
+def build_initials(nombres: str | None) -> str | None:
+    if not nombres:
+        return None
+    parts = [p.strip() for p in nombres.split() if p.strip()]
+    if not parts:
+        return None
+    return "".join(part[0].upper() for part in parts if part)
+
+
+def parse_docente_principal_raw(docente_raw: str) -> dict:
+    raw = str(docente_raw).strip()
+    parts = [p.strip() for p in raw.split("/") if p.strip()]
+
+    apellido_1 = None
+    apellido_2 = None
+    nombres = None
+
+    if len(parts) >= 3:
+        apellido_1 = to_title_or_none(parts[0])
+        apellido_2 = to_title_or_none(parts[1])
+        nombres = to_title_or_none(" ".join(parts[2:]))
+    elif len(parts) == 2:
+        apellido_1 = to_title_or_none(parts[0])
+        nombres = to_title_or_none(parts[1])
+    else:
+        nombres = to_title_or_none(raw)
+
+    full_for_normalization = " ".join(
+        [x for x in [apellido_1, apellido_2, nombres] if x]
+    )
+
+    return {
+        "nombre_original": raw,
+        "nombre_normalizado": normalize_docente_name(full_for_normalization),
+        "apellido_1": apellido_1,
+        "apellido_2": apellido_2,
+        "nombres": nombres,
+        "iniciales": build_initials(nombres),
+    }
+
+
+def get_latest_excel_blob_name(container_name: str) -> str:
+    blob_service = get_blob_service()
+    container_client = blob_service.get_container_client(container_name)
+
+    blobs = [
+        b for b in container_client.list_blobs()
+        if b.name.lower().endswith(".xlsx") or b.name.lower().endswith(".xlsm")
+    ]
+    if not blobs:
+        raise RuntimeError(f"No Excel files found in container: {container_name}")
+
+    latest = max(blobs, key=lambda b: b.last_modified)
+    return latest.name
+
+
+def download_blob_bytes(container_name: str, blob_name: str) -> bytes:
+    blob_service = get_blob_service()
+    blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+    return blob_client.download_blob().readall()
+
+
+def upload_bytes_blob(container_name: str, blob_name: str, content: bytes) -> None:
+    blob_service = get_blob_service()
+    blob_client = blob_service.get_blob_client(container=container_name, blob=blob_name)
+    blob_client.upload_blob(content, overwrite=True)
+
+
+def find_docentes_header_indices(worksheet) -> tuple[int, int | None, int]:
+    max_scan_rows = min(10, worksheet.max_row)
+
+    for row_idx in range(1, max_scan_rows + 1):
+        row_values = list(
+            worksheet.iter_rows(
+                min_row=row_idx,
+                max_row=row_idx,
+                values_only=True
+            )
+        )[0]
+
+        normalized = [normalize_generic_text(v) for v in row_values]
+
+        docente_idx = None
+        codigo_idx = None
+
+        for idx, value in enumerate(normalized):
+            if "docente principal" in value:
+                docente_idx = idx
+            if "codigo" in value and "docente" in value:
+                codigo_idx = idx
+            elif "codigo docente" in value:
+                codigo_idx = idx
+            elif "cod docente" in value:
+                codigo_idx = idx
+
+        if docente_idx is not None:
+            return row_idx, codigo_idx, docente_idx
+
+    raise RuntimeError(
+        f"Could not find header row with 'Docente Principal' in sheet '{worksheet.title}'"
+    )
+
+
+def extract_docentes_from_workbook_bytes(
+    workbook_bytes: bytes,
+    source_file_name: str,
+    periodo_academico: str,
+) -> list[dict]:
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(filename=io.BytesIO(workbook_bytes), data_only=True)
+    extracted_rows: list[dict] = []
+
+    for sheet_name, carrera in DOCENTES_SHEET_CAREERS.items():
+        if sheet_name not in workbook.sheetnames:
+            logging.warning("Sheet '%s' not found in workbook. Skipping.", sheet_name)
+            continue
+
+        ws = workbook[sheet_name]
+        header_row_idx, codigo_idx, docente_idx = find_docentes_header_indices(ws)
+
+        for excel_row_idx in range(header_row_idx + 1, ws.max_row + 1):
+            row_values = list(
+                ws.iter_rows(
+                    min_row=excel_row_idx,
+                    max_row=excel_row_idx,
+                    values_only=True
+                )
+            )[0]
+
+            docente_raw = None
+            codigo_raw = None
+
+            if docente_idx is not None and docente_idx < len(row_values):
+                docente_raw = row_values[docente_idx]
+            if codigo_idx is not None and codigo_idx < len(row_values):
+                codigo_raw = row_values[codigo_idx]
+
+            if docente_raw is None or str(docente_raw).strip() == "":
+                continue
+
+            parsed = parse_docente_principal_raw(str(docente_raw))
+
+            extracted_rows.append(
+                {
+                    "periodo_academico": periodo_academico,
+                    "source_file_name": source_file_name,
+                    "source_sheet_name": sheet_name,
+                    "source_row_number": excel_row_idx,
+                    "carrera_fuente": carrera,
+                    "codigo_docente_raw": str(codigo_raw).strip() if codigo_raw is not None else None,
+                    "docente_principal_raw": parsed["nombre_original"],
+                    "docente_principal_normalizado": parsed["nombre_normalizado"],
+                    "apellido_1": parsed["apellido_1"],
+                    "apellido_2": parsed["apellido_2"],
+                    "nombres": parsed["nombres"],
+                    "iniciales": parsed["iniciales"],
+                }
+            )
+
+    if not extracted_rows:
+        raise RuntimeError("No docentes extracted from workbook.")
+
+    return extracted_rows
+
+
+def insert_docentes_raw_rows(run_id: int, rows: list[dict]) -> int:
+    from mssql_python import connect
+
+    sql_conn_str = get_sql_connection_string()
+
+    with connect(sql_conn_str) as conn:
+        cursor = conn.cursor()
+
+        for row in rows:
+            cursor.execute(
+                """
+                INSERT INTO stg.docentes_ulima_raw (
+                    run_id,
+                    periodo_academico,
+                    source_file_name,
+                    source_sheet_name,
+                    source_row_number,
+                    carrera_fuente,
+                    codigo_docente_raw,
+                    docente_principal_raw,
+                    docente_principal_normalizado
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    row["periodo_academico"],
+                    row["source_file_name"],
+                    row["source_sheet_name"],
+                    row["source_row_number"],
+                    row["carrera_fuente"],
+                    row["codigo_docente_raw"],
+                    row["docente_principal_raw"],
+                    row["docente_principal_normalizado"],
+                )
+            )
+
+        conn.commit()
+        cursor.close()
+
+    return len(rows)
+
+
+def rebuild_docentes_reference(run_id: int, rows: list[dict], periodo_academico: str) -> int:
+    from mssql_python import connect
+
+    unique_map: dict[tuple[str, str, str], dict] = {}
+
+    for row in rows:
+        key = (
+            row["periodo_academico"],
+            row["carrera_fuente"],
+            row["docente_principal_normalizado"],
+        )
+
+        if key not in unique_map:
+            unique_map[key] = {
+                "periodo_academico": row["periodo_academico"],
+                "carrera": row["carrera_fuente"],
+                "codigo_docente": row["codigo_docente_raw"],
+                "nombre_original": row["docente_principal_raw"],
+                "nombre_normalizado": row["docente_principal_normalizado"],
+                "apellido_1": row["apellido_1"],
+                "apellido_2": row["apellido_2"],
+                "nombres": row["nombres"],
+                "iniciales": row["iniciales"],
+                "activo": 1,
+                "source_run_id": run_id,
+            }
+        else:
+            # si el existente no tiene código y esta fila sí, lo actualizamos
+            if not unique_map[key]["codigo_docente"] and row["codigo_docente_raw"]:
+                unique_map[key]["codigo_docente"] = row["codigo_docente_raw"]
+
+    deduped_rows = list(unique_map.values())
+    sql_conn_str = get_sql_connection_string()
+
+    with connect(sql_conn_str) as conn:
+        cursor = conn.cursor()
+
+        # borramos solo el periodo actual para reconstruirlo limpio
+        cursor.execute(
+            "DELETE FROM ref.docentes_ulima WHERE periodo_academico = ?",
+            (periodo_academico,)
+        )
+
+        for row in deduped_rows:
+            cursor.execute(
+                """
+                INSERT INTO ref.docentes_ulima (
+                    periodo_academico,
+                    carrera,
+                    codigo_docente,
+                    nombre_original,
+                    nombre_normalizado,
+                    apellido_1,
+                    apellido_2,
+                    nombres,
+                    iniciales,
+                    activo,
+                    source_run_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["periodo_academico"],
+                    row["carrera"],
+                    row["codigo_docente"],
+                    row["nombre_original"],
+                    row["nombre_normalizado"],
+                    row["apellido_1"],
+                    row["apellido_2"],
+                    row["nombres"],
+                    row["iniciales"],
+                    row["activo"],
+                    row["source_run_id"],
+                )
+            )
+
+        conn.commit()
+        cursor.close()
+
+    return len(deduped_rows)
+
+
+@app.route(route="run-ingest-docentes", methods=["GET", "POST"])
+def run_ingest_docentes(req: func.HttpRequest) -> func.HttpResponse:
+    run_id = None
+
+    try:
+        docentes_container = get_env("DOCENTES_CONTAINER")
+        periodo_academico = get_env("DOCENTES_ACTIVE_PERIOD")
+        processed_container = get_env("PROCESSED_CONTAINER")
+        logs_container = get_env("LOGS_CONTAINER")
+
+        requested_blob = req.params.get("blob_name")
+        blob_name = requested_blob or get_latest_excel_blob_name(docentes_container)
+
+        run_id = create_pipeline_run(
+            trigger_type="MANUAL",
+            source_name="DOCENTES_ULIMA",
+            source_file_name=blob_name,
+            source_file_path=f"{docentes_container}/{blob_name}"
+        )
+
+        workbook_bytes = download_blob_bytes(docentes_container, blob_name)
+
+        extracted_rows = extract_docentes_from_workbook_bytes(
+            workbook_bytes=workbook_bytes,
+            source_file_name=blob_name,
+            periodo_academico=periodo_academico,
+        )
+
+        raw_rows_loaded = insert_docentes_raw_rows(run_id, extracted_rows)
+        docentes_unique_loaded = rebuild_docentes_reference(
+            run_id=run_id,
+            rows=extracted_rows,
+            periodo_academico=periodo_academico,
+        )
+
+        processed_name = (
+            f"docentes/{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{os.path.basename(blob_name)}"
+        )
+        upload_bytes_blob(processed_container, processed_name, workbook_bytes)
+
+        log_payload = {
+            "run_id": run_id,
+            "source_blob": blob_name,
+            "processed_blob": processed_name,
+            "periodo_academico": periodo_academico,
+            "raw_rows_loaded": raw_rows_loaded,
+            "docentes_unique_loaded": docentes_unique_loaded,
+            "utc_now": utc_now_iso(),
+            "status": "SUCCESS",
+        }
+
+        log_name = f"docentes_run_{run_id}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+        upload_text_blob(logs_container, log_name, json.dumps(log_payload, ensure_ascii=False, indent=2))
+
+        update_pipeline_run(
+            run_id=run_id,
+            status="SUCCESS",
+            records_read=raw_rows_loaded,
+            records_inserted=docentes_unique_loaded,
+            records_updated=0,
+            records_rejected=0,
+            error_message=None
+        )
+
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "message": "Docentes ingestion completed successfully.",
+                    "run_id": run_id,
+                    "source_blob": blob_name,
+                    "processed_blob": processed_name,
+                    "periodo_academico": periodo_academico,
+                    "raw_rows_loaded": raw_rows_loaded,
+                    "docentes_unique_loaded": docentes_unique_loaded,
+                    "utc_now": utc_now_iso(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            status_code=200,
+            mimetype="application/json",
+        )
+
+    except Exception as exc:
+        logging.exception("Docentes ingestion failed")
+
+        if run_id is not None:
+            update_pipeline_run(
+                run_id=run_id,
+                status="FAILED",
+                error_message=str(exc)
+            )
+
+        return func.HttpResponse(
+            json.dumps(
+                {
+                    "status": "error",
+                    "message": str(exc),
+                    "run_id": run_id,
+                    "utc_now": utc_now_iso(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            status_code=500,
+            mimetype="application/json",
+        )
+
+
+
+
+# =========================
 # HTTP FUNCTIONS
 # =========================
 @app.route(route="health", methods=["GET"])
@@ -726,3 +1172,4 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             status_code=500,
             mimetype="application/json",
         )
+

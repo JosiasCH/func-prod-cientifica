@@ -131,6 +131,15 @@ def infer_career_from_text(value: str | None) -> str | None:
     return None
 
 
+def has_engineering_context(value: str | None) -> bool:
+    norm = normalize_generic_text(value)
+    return (
+        "faculty of engineering" in norm
+        or "facultad de ingenieria" in norm
+        or infer_career_from_text(value) is not None
+    )
+
+
 # =========================
 # STORAGE HELPERS
 # =========================
@@ -609,7 +618,7 @@ def rebuild_docentes_reference(run_id: int, rows: list[dict], periodo_academico:
 
 
 # =========================
-# DOCENTES REF MATCHING (V4.2)
+# DOCENTES REF MATCHING (V4.3)
 # =========================
 def build_docente_display_name(docente: dict) -> str:
     family = " ".join([x for x in [docente.get("apellido_1"), docente.get("apellido_2")] if x])
@@ -907,7 +916,8 @@ def unique_alias_match(
 def match_scopus_author_to_docente(
     scopus_author_name: str,
     docentes_ref: list[dict],
-    career_hint: str | None = None
+    career_hint: str | None = None,
+    allow_weak_alias: bool = False
 ) -> dict:
     parsed = parse_scopus_author_name(scopus_author_name)
     scopus_aliases = build_scopus_author_aliases(parsed)
@@ -992,27 +1002,39 @@ def match_scopus_author_to_docente(
             "docente": None,
         }
 
-    # 4) alias débil (apellido1 + iniciales / nombre), solo si queda único
-    weak_match = unique_alias_match(
-        scopus_aliases=scopus_aliases["weak_aliases"],
-        docentes_ref=docentes_ref,
-        alias_key="weak_aliases",
-        career_hint=career_hint
-    )
-    if weak_match["matched"]:
-        return {
-            "matched": True,
-            "ambiguous": False,
-            "match_method": "DOCENTES_REF_ALIAS_WEAK",
-            "docente": weak_match["docente"],
-        }
-    if weak_match["ambiguous"]:
-        return {
-            "matched": False,
-            "ambiguous": True,
-            "match_method": "DOCENTES_REF_ALIAS_WEAK_AMBIGUOUS",
-            "docente": None,
-        }
+    # 4) alias débil solo con contexto fuerte de ingeniería
+    # y solo si el apellido_1 queda único en el padrón filtrado
+    if allow_weak_alias and parsed["apellido_1"]:
+        candidate_pool = filter_candidates_by_career_hint(docentes_ref, career_hint)
+
+        same_primary_surname = [
+            d for d in candidate_pool
+            if d.get("apellido_1_norm") == parsed["apellido_1"]
+        ]
+
+        if len(same_primary_surname) == 1:
+            weak_match = unique_alias_match(
+                scopus_aliases=scopus_aliases["weak_aliases"],
+                docentes_ref=same_primary_surname,
+                alias_key="weak_aliases",
+                career_hint=career_hint
+            )
+
+            if weak_match["matched"]:
+                return {
+                    "matched": True,
+                    "ambiguous": False,
+                    "match_method": "DOCENTES_REF_ALIAS_WEAK_UNIQUE_SURNAME",
+                    "docente": weak_match["docente"],
+                }
+
+            if weak_match["ambiguous"]:
+                return {
+                    "matched": False,
+                    "ambiguous": True,
+                    "match_method": "DOCENTES_REF_ALIAS_WEAK_AMBIGUOUS",
+                    "docente": None,
+                }
 
     return {
         "matched": False,
@@ -1046,6 +1068,7 @@ def enrich_ulima_fields_from_ref(
             continue
 
         career_hint = infer_career_from_text(block) or infer_career_from_text(affiliations_value)
+        engineering_context = has_engineering_context(block)
 
         if idx < len(full_authors):
             scopus_author_name = full_authors[idx]
@@ -1057,7 +1080,8 @@ def enrich_ulima_fields_from_ref(
         match_result = match_scopus_author_to_docente(
             scopus_author_name=scopus_author_name,
             docentes_ref=docentes_ref,
-            career_hint=career_hint
+            career_hint=career_hint,
+            allow_weak_alias=engineering_context
         )
 
         if match_result["matched"]:

@@ -58,7 +58,7 @@ def normalize_generic_text(value: str | None) -> str:
     value = unicodedata.normalize("NFKD", value)
     value = "".join(ch for ch in value if not unicodedata.combining(ch))
     value = value.replace("\\", " ")
-    value = value.replace("–", " ").replace("—", " ")
+    value = value.replace("–", " ").replace("—", " ").replace("-", " ")
     value = re.sub(r"\s+", " ", value).strip()
     return value
 
@@ -69,6 +69,7 @@ def normalize_person_name(value: str | None) -> str:
     norm = normalize_generic_text(value)
     norm = norm.replace(",", " ")
     norm = norm.replace("/", " ")
+    norm = norm.replace(".", " ")
     norm = re.sub(r"\s+", " ", norm).strip()
     return norm
 
@@ -86,6 +87,48 @@ def clean_author_full_name(value: str) -> str:
 def is_ulima_text(value: str | None) -> bool:
     norm = normalize_generic_text(value)
     return ("universidad de lima" in norm) or ("university of lima" in norm)
+
+
+def row_attr(row, attr: str, idx: int):
+    try:
+        return getattr(row, attr)
+    except AttributeError:
+        return row[idx]
+
+
+# =========================
+# CAREER HINTS FROM TEXT
+# =========================
+CAREER_PATTERNS = {
+    "Ingeniería Industrial": [
+        "carrera de ingenieria industrial",
+        "industrial engineering career",
+        "ingenieria industrial",
+        "industrial engineering",
+    ],
+    "Ingeniería de Sistemas": [
+        "carrera de ingenieria de sistemas",
+        "systems engineering career",
+        "ingenieria de sistemas",
+        "ingenieria de sistemas computacionales",
+        "systems engineering",
+        "computer systems engineering",
+    ],
+    "Ingeniería Civil": [
+        "carrera de ingenieria civil",
+        "civil engineering career",
+        "ingenieria civil",
+        "civil engineering",
+    ],
+}
+
+
+def infer_career_from_text(value: str | None) -> str | None:
+    norm = normalize_generic_text(value)
+    for career, patterns in CAREER_PATTERNS.items():
+        if any(pattern in norm for pattern in patterns):
+            return career
+    return None
 
 
 # =========================
@@ -275,13 +318,6 @@ def execute_upsert_from_staging(run_id: int) -> None:
         cursor.execute("EXEC dbo.usp_upsert_publications_from_stg @run_id = ?", (run_id,))
         conn.commit()
         cursor.close()
-
-
-def row_attr(row, attr: str, idx: int):
-    try:
-        return getattr(row, attr)
-    except AttributeError:
-        return row[idx]
 
 
 # =========================
@@ -575,13 +611,6 @@ def rebuild_docentes_reference(run_id: int, rows: list[dict], periodo_academico:
 # =========================
 # DOCENTES REF MATCHING
 # =========================
-def build_name_initials(nombres: str | None) -> str:
-    if not nombres:
-        return ""
-    tokens = [t for t in normalize_generic_text(nombres).split() if t]
-    return "".join(token[0].upper() for token in tokens if token)
-
-
 def build_docente_display_name(docente: dict) -> str:
     family = " ".join([x for x in [docente.get("apellido_1"), docente.get("apellido_2")] if x])
     names = docente.get("nombres")
@@ -682,7 +711,7 @@ def parse_scopus_author_name(scopus_author_name: str) -> dict:
     if "," in raw:
         family_part, given_part = [p.strip() for p in raw.split(",", 1)]
     else:
-        tokens = [t.strip() for t in raw.split() if t.strip()]
+        tokens = [t.strip() for t in raw.replace(".", " ").split() if t.strip()]
         if len(tokens) >= 2:
             family_part = " ".join(tokens[:-1])
             given_part = tokens[-1]
@@ -690,21 +719,22 @@ def parse_scopus_author_name(scopus_author_name: str) -> dict:
             family_part = raw
             given_part = ""
 
-    family_norm = normalize_generic_text(family_part)
-    family_tokens = [t for t in family_norm.split() if t]
-    given_norm = normalize_generic_text(given_part.replace(".", " "))
-    given_tokens = [t for t in given_norm.split() if t]
+    family_tokens = [t for t in normalize_generic_text(family_part).split() if t]
+    given_tokens = [t for t in normalize_generic_text(given_part.replace(".", " ")).split() if t]
 
     apellido_1 = family_tokens[0] if family_tokens else None
     apellido_2 = " ".join(family_tokens[1:]) if len(family_tokens) > 1 else None
     initials = "".join(token[0].upper() for token in given_tokens if token)
 
     normalized_full = normalize_person_name(f"{family_part} {given_part}")
+    family_signature = " ".join(family_tokens)
 
     return {
         "raw": raw,
         "apellido_1": apellido_1,
         "apellido_2": apellido_2,
+        "family_tokens": family_tokens,
+        "family_signature": family_signature,
         "given_tokens": given_tokens,
         "initials": initials,
         "normalized_full": normalized_full,
@@ -713,13 +743,16 @@ def parse_scopus_author_name(scopus_author_name: str) -> dict:
 
 def given_names_match(ref_nombres: str | None, scopus_given_tokens: list[str], scopus_initials: str) -> bool:
     ref_tokens = [t for t in normalize_generic_text(ref_nombres).split() if t]
+
     if not scopus_given_tokens and not scopus_initials:
         return True
 
-    if scopus_initials and all(len(tok) == 1 for tok in scopus_given_tokens):
+    # caso de iniciales, por ejemplo S. / J. M.
+    if scopus_initials and (not scopus_given_tokens or all(len(tok) == 1 for tok in scopus_given_tokens)):
         ref_initials = "".join(token[0].upper() for token in ref_tokens if token)
         return ref_initials.startswith(scopus_initials)
 
+    # caso de nombres escritos, exigir prefijo exacto ordenado
     if scopus_given_tokens:
         if len(ref_tokens) < len(scopus_given_tokens):
             return False
@@ -731,13 +764,26 @@ def given_names_match(ref_nombres: str | None, scopus_given_tokens: list[str], s
     return False
 
 
-def match_scopus_author_to_docente(scopus_author_name: str, docentes_ref: list[dict]) -> dict:
+def filter_candidates_by_career_hint(candidates: list[dict], career_hint: str | None) -> list[dict]:
+    if not career_hint:
+        return candidates
+    filtered = [c for c in candidates if c.get("carrera") == career_hint]
+    return filtered if filtered else candidates
+
+
+def match_scopus_author_to_docente(
+    scopus_author_name: str,
+    docentes_ref: list[dict],
+    career_hint: str | None = None
+) -> dict:
     parsed = parse_scopus_author_name(scopus_author_name)
 
+    # 1) match exacto por nombre normalizado completo
     exact_matches = [
         d for d in docentes_ref
         if d["nombre_normalizado"] == parsed["normalized_full"]
     ]
+    exact_matches = filter_candidates_by_career_hint(exact_matches, career_hint)
 
     if len(exact_matches) == 1:
         return {
@@ -755,27 +801,24 @@ def match_scopus_author_to_docente(scopus_author_name: str, docentes_ref: list[d
             "docente": None,
         }
 
-    if not parsed["apellido_1"] or not parsed["apellido_2"]:
-        return {
-            "matched": False,
-            "ambiguous": False,
-            "match_method": "DOCENTES_REF_NO_MATCH",
-            "docente": None,
-        }
-
+    # 2) match estructural exacto por apellido1 + apellido2 + nombres/iniciales
     structured_matches = []
     for docente in docentes_ref:
         ref_ap1 = normalize_generic_text(docente.get("apellido_1"))
         ref_ap2 = normalize_generic_text(docente.get("apellido_2"))
 
-        if ref_ap1 != parsed["apellido_1"]:
+        if parsed["apellido_1"] and ref_ap1 != parsed["apellido_1"]:
             continue
-        if ref_ap2 != parsed["apellido_2"]:
+        if parsed["apellido_2"] and ref_ap2 != parsed["apellido_2"]:
+            continue
+        if not parsed["apellido_1"]:
             continue
         if not given_names_match(docente.get("nombres"), parsed["given_tokens"], parsed["initials"]):
             continue
 
         structured_matches.append(docente)
+
+    structured_matches = filter_candidates_by_career_hint(structured_matches, career_hint)
 
     if len(structured_matches) == 1:
         return {
@@ -792,6 +835,38 @@ def match_scopus_author_to_docente(scopus_author_name: str, docentes_ref: list[d
             "match_method": "DOCENTES_REF_STRUCTURED_AMBIGUOUS",
             "docente": None,
         }
+
+    # 3) fallback controlado: un solo apellido + nombres/iniciales, solo si queda único
+    if parsed["apellido_1"]:
+        single_surname_matches = []
+        for docente in docentes_ref:
+            ref_ap1 = normalize_generic_text(docente.get("apellido_1"))
+            ref_ap2 = normalize_generic_text(docente.get("apellido_2"))
+
+            if ref_ap1 != parsed["apellido_1"] and ref_ap2 != parsed["apellido_1"]:
+                continue
+            if not given_names_match(docente.get("nombres"), parsed["given_tokens"], parsed["initials"]):
+                continue
+
+            single_surname_matches.append(docente)
+
+        single_surname_matches = filter_candidates_by_career_hint(single_surname_matches, career_hint)
+
+        if len(single_surname_matches) == 1:
+            return {
+                "matched": True,
+                "ambiguous": False,
+                "match_method": "DOCENTES_REF_SURNAME_INITIAL",
+                "docente": single_surname_matches[0],
+            }
+
+        if len(single_surname_matches) > 1:
+            return {
+                "matched": False,
+                "ambiguous": True,
+                "match_method": "DOCENTES_REF_SURNAME_INITIAL_AMBIGUOUS",
+                "docente": None,
+            }
 
     return {
         "matched": False,
@@ -824,6 +899,8 @@ def enrich_ulima_fields_from_ref(
         if not is_ulima_text(block):
             continue
 
+        career_hint = infer_career_from_text(block) or infer_career_from_text(affiliations_value)
+
         if idx < len(full_authors):
             scopus_author_name = full_authors[idx]
         elif idx < len(short_authors):
@@ -831,7 +908,11 @@ def enrich_ulima_fields_from_ref(
         else:
             scopus_author_name = block.split(",", 2)[0].strip()
 
-        match_result = match_scopus_author_to_docente(scopus_author_name, docentes_ref)
+        match_result = match_scopus_author_to_docente(
+            scopus_author_name=scopus_author_name,
+            docentes_ref=docentes_ref,
+            career_hint=career_hint
+        )
 
         if match_result["matched"]:
             matched_any = True

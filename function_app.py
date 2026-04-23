@@ -123,21 +123,18 @@ CAREER_PATTERNS = {
 }
 
 
-def infer_career_from_text(value: str | None) -> str | None:
+def infer_careers_from_text(value: str | None) -> list[str]:
     norm = normalize_generic_text(value)
+    found: list[str] = []
     for career, patterns in CAREER_PATTERNS.items():
         if any(pattern in norm for pattern in patterns):
-            return career
-    return None
+            found.append(career)
+    return found
 
 
-def has_engineering_context(value: str | None) -> bool:
-    norm = normalize_generic_text(value)
-    return (
-        "faculty of engineering" in norm
-        or "facultad de ingenieria" in norm
-        or infer_career_from_text(value) is not None
-    )
+def infer_career_from_text(value: str | None) -> str | None:
+    careers = infer_careers_from_text(value)
+    return careers[0] if careers else None
 
 
 # =========================
@@ -618,7 +615,7 @@ def rebuild_docentes_reference(run_id: int, rows: list[dict], periodo_academico:
 
 
 # =========================
-# DOCENTES REF MATCHING (V4.3)
+# DOCENTES REF MATCHING / NORMALIZATION
 # =========================
 def build_docente_display_name(docente: dict) -> str:
     family = " ".join([x for x in [docente.get("apellido_1"), docente.get("apellido_2")] if x])
@@ -916,13 +913,11 @@ def unique_alias_match(
 def match_scopus_author_to_docente(
     scopus_author_name: str,
     docentes_ref: list[dict],
-    career_hint: str | None = None,
-    allow_weak_alias: bool = False
+    career_hint: str | None = None
 ) -> dict:
     parsed = parse_scopus_author_name(scopus_author_name)
     scopus_aliases = build_scopus_author_aliases(parsed)
 
-    # 1) exacto por nombre normalizado completo
     exact_matches = [
         d for d in docentes_ref
         if d["nombre_normalizado"] == parsed["normalized_full"]
@@ -945,7 +940,6 @@ def match_scopus_author_to_docente(
             "docente": None,
         }
 
-    # 2) match estructural exacto por apellido1 + apellido2 + nombres/iniciales
     structured_matches = []
     for docente in docentes_ref:
         ref_ap1 = docente.get("apellido_1_norm")
@@ -980,7 +974,6 @@ def match_scopus_author_to_docente(
             "docente": None,
         }
 
-    # 3) alias fuerte (apellido1 apellido2 + iniciales / nombre)
     strong_match = unique_alias_match(
         scopus_aliases=scopus_aliases["strong_aliases"],
         docentes_ref=docentes_ref,
@@ -1002,46 +995,49 @@ def match_scopus_author_to_docente(
             "docente": None,
         }
 
-    # 4) alias débil solo con contexto fuerte de ingeniería
-    # y solo si el apellido_1 queda único en el padrón filtrado
-    if allow_weak_alias and parsed["apellido_1"]:
-        candidate_pool = filter_candidates_by_career_hint(docentes_ref, career_hint)
-
-        same_primary_surname = [
-            d for d in candidate_pool
-            if d.get("apellido_1_norm") == parsed["apellido_1"]
-        ]
-
-        if len(same_primary_surname) == 1:
-            weak_match = unique_alias_match(
-                scopus_aliases=scopus_aliases["weak_aliases"],
-                docentes_ref=same_primary_surname,
-                alias_key="weak_aliases",
-                career_hint=career_hint
-            )
-
-            if weak_match["matched"]:
-                return {
-                    "matched": True,
-                    "ambiguous": False,
-                    "match_method": "DOCENTES_REF_ALIAS_WEAK_UNIQUE_SURNAME",
-                    "docente": weak_match["docente"],
-                }
-
-            if weak_match["ambiguous"]:
-                return {
-                    "matched": False,
-                    "ambiguous": True,
-                    "match_method": "DOCENTES_REF_ALIAS_WEAK_AMBIGUOUS",
-                    "docente": None,
-                }
-
     return {
         "matched": False,
         "ambiguous": False,
         "match_method": "DOCENTES_REF_NO_MATCH",
         "docente": None,
     }
+
+
+# =========================
+# AFFILIATION-FIRST ENRICHMENT
+# =========================
+def unique_keep_order(items: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
+    return result
+
+
+def get_publication_level_engineering_careers(affiliations_value: str | None) -> list[str]:
+    if not is_ulima_text(affiliations_value):
+        return []
+    return unique_keep_order(infer_careers_from_text(affiliations_value))
+
+
+def get_block_engineering_careers(
+    block_value: str | None,
+    publication_level_careers: list[str]
+) -> list[str]:
+    if not is_ulima_text(block_value):
+        return []
+
+    block_careers = unique_keep_order(infer_careers_from_text(block_value))
+    if block_careers:
+        return block_careers
+
+    # fallback solo si la afiliación global ULima trae una sola carrera explícita
+    if len(publication_level_careers) == 1:
+        return publication_level_careers
+
+    return []
 
 
 def enrich_ulima_fields_from_ref(
@@ -1058,17 +1054,32 @@ def enrich_ulima_fields_from_ref(
         authors_with_affiliations_value=authors_with_affiliations_value,
     )
 
+    publication_level_careers = get_publication_level_engineering_careers(affiliations_value)
+
     matched_docentes: list[str] = []
-    matched_careers: list[str] = []
+    publication_careers: list[str] = []
     first_author_ulima = False
     matched_any = False
+    affiliation_engineering_detected = False
 
     for idx, block in enumerate(author_blocks):
         if not is_ulima_text(block):
             continue
 
-        career_hint = infer_career_from_text(block) or infer_career_from_text(affiliations_value)
-        engineering_context = has_engineering_context(block)
+        block_careers = get_block_engineering_careers(
+            block_value=block,
+            publication_level_careers=publication_level_careers,
+        )
+
+        # Solo consideramos Ingeniería si la afiliación lo dice explícitamente
+        if not block_careers:
+            continue
+
+        affiliation_engineering_detected = True
+        publication_careers.extend(block_careers)
+
+        if idx == 0:
+            first_author_ulima = True
 
         if idx < len(full_authors):
             scopus_author_name = full_authors[idx]
@@ -1077,11 +1088,13 @@ def enrich_ulima_fields_from_ref(
         else:
             scopus_author_name = block.split(",", 2)[0].strip()
 
+        # career_hint solo si el bloque resolvió una sola carrera
+        career_hint = block_careers[0] if len(block_careers) == 1 else None
+
         match_result = match_scopus_author_to_docente(
             scopus_author_name=scopus_author_name,
             docentes_ref=docentes_ref,
             career_hint=career_hint,
-            allow_weak_alias=engineering_context
         )
 
         if match_result["matched"]:
@@ -1092,19 +1105,27 @@ def enrich_ulima_fields_from_ref(
             if display_name and display_name not in matched_docentes:
                 matched_docentes.append(display_name)
 
-            carrera = docente.get("carrera")
-            if carrera and carrera not in matched_careers:
-                matched_careers.append(carrera)
+    # Si no hubo bloques útiles, pero la afiliación global sí dice carrera ULima Ingeniería,
+    # igual llenamos carrera_raw a nivel publicación
+    if not publication_careers and publication_level_careers:
+        publication_careers.extend(publication_level_careers)
+        affiliation_engineering_detected = True
 
-            if idx == 0:
-                first_author_ulima = True
+    publication_careers = unique_keep_order(publication_careers)
+
+    if matched_any and publication_careers:
+        metodo = "AFFILIATION+DOCENTES_REF"
+    elif publication_careers:
+        metodo = "AFFILIATION_ONLY"
+    else:
+        metodo = None
 
     return {
         "ulima_docentes_raw": "; ".join(matched_docentes) if matched_docentes else None,
         "first_author_ulima_raw": "True" if first_author_ulima else "False",
-        "carrera_raw": "; ".join(matched_careers) if matched_careers else None,
-        "metodo_cruce_scopus_raw": "AUTHORS_WITH_AFFILIATIONS+DOCENTES_REF" if matched_any else None,
-        "es_ulima_raw_detected": True if any(is_ulima_text(b) for b in author_blocks) or is_ulima_text(affiliations_value) else False,
+        "carrera_raw": "; ".join(publication_careers) if publication_careers else None,
+        "metodo_cruce_scopus_raw": metodo,
+        "es_ulima_raw_detected": affiliation_engineering_detected,
     }
 
 

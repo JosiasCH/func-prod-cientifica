@@ -609,7 +609,7 @@ def rebuild_docentes_reference(run_id: int, rows: list[dict], periodo_academico:
 
 
 # =========================
-# DOCENTES REF MATCHING
+# DOCENTES REF MATCHING (V4.2)
 # =========================
 def build_docente_display_name(docente: dict) -> str:
     family = " ".join([x for x in [docente.get("apellido_1"), docente.get("apellido_2")] if x])
@@ -617,6 +617,67 @@ def build_docente_display_name(docente: dict) -> str:
     if family and names:
         return f"{family.title()}, {names.title()}"
     return (docente.get("nombre_original") or "").replace("/", " ").title()
+
+
+def first_given_name(nombres: str | None) -> str:
+    tokens = [t for t in normalize_generic_text(nombres).split() if t]
+    return tokens[0] if tokens else ""
+
+
+def initials_variants_from_tokens(tokens: list[str]) -> set[str]:
+    if not tokens:
+        return set()
+    initials = "".join(token[0] for token in tokens if token)
+    variants = {initials}
+    if initials:
+        variants.add(initials[0])
+    return {v for v in variants if v}
+
+
+def prepare_docente_reference_entry(docente: dict) -> dict:
+    apellido_1_norm = normalize_generic_text(docente.get("apellido_1"))
+    apellido_2_norm = normalize_generic_text(docente.get("apellido_2"))
+    nombres_norm = normalize_generic_text(docente.get("nombres"))
+    nombre_normalizado = normalize_person_name(docente.get("nombre_normalizado") or docente.get("nombre_original"))
+
+    family_signature = " ".join([x for x in [apellido_1_norm, apellido_2_norm] if x]).strip()
+    first_name = first_given_name(docente.get("nombres"))
+    initials_full = normalize_generic_text(docente.get("iniciales"))
+
+    strong_aliases: set[str] = set()
+    weak_aliases: set[str] = set()
+
+    if nombre_normalizado:
+        strong_aliases.add(nombre_normalizado)
+
+    initials_variants = {initials_full}
+    if initials_full:
+        initials_variants.add(initials_full[:1])
+
+    if family_signature:
+        for iv in initials_variants:
+            if iv:
+                strong_aliases.add(f"{family_signature} {iv}".strip())
+        if first_name:
+            strong_aliases.add(f"{family_signature} {first_name}".strip())
+
+    if apellido_1_norm:
+        for iv in initials_variants:
+            if iv:
+                weak_aliases.add(f"{apellido_1_norm} {iv}".strip())
+        if first_name:
+            weak_aliases.add(f"{apellido_1_norm} {first_name}".strip())
+
+    docente_prepared = dict(docente)
+    docente_prepared["apellido_1_norm"] = apellido_1_norm
+    docente_prepared["apellido_2_norm"] = apellido_2_norm
+    docente_prepared["nombres_norm"] = nombres_norm
+    docente_prepared["family_signature"] = family_signature
+    docente_prepared["first_name_norm"] = first_name
+    docente_prepared["strong_aliases"] = strong_aliases
+    docente_prepared["weak_aliases"] = weak_aliases
+
+    return docente_prepared
 
 
 def get_docentes_reference(periodo_academico: str) -> list[dict]:
@@ -651,20 +712,19 @@ def get_docentes_reference(periodo_academico: str) -> list[dict]:
         cursor.close()
 
     for row in rows:
-        docentes.append(
-            {
-                "docente_ref_id": row_attr(row, "docente_ref_id", 0),
-                "periodo_academico": row_attr(row, "periodo_academico", 1),
-                "carrera": row_attr(row, "carrera", 2),
-                "codigo_docente": row_attr(row, "codigo_docente", 3),
-                "nombre_original": row_attr(row, "nombre_original", 4),
-                "nombre_normalizado": row_attr(row, "nombre_normalizado", 5),
-                "apellido_1": row_attr(row, "apellido_1", 6),
-                "apellido_2": row_attr(row, "apellido_2", 7),
-                "nombres": row_attr(row, "nombres", 8),
-                "iniciales": row_attr(row, "iniciales", 9),
-            }
-        )
+        docente = {
+            "docente_ref_id": row_attr(row, "docente_ref_id", 0),
+            "periodo_academico": row_attr(row, "periodo_academico", 1),
+            "carrera": row_attr(row, "carrera", 2),
+            "codigo_docente": row_attr(row, "codigo_docente", 3),
+            "nombre_original": row_attr(row, "nombre_original", 4),
+            "nombre_normalizado": row_attr(row, "nombre_normalizado", 5),
+            "apellido_1": row_attr(row, "apellido_1", 6),
+            "apellido_2": row_attr(row, "apellido_2", 7),
+            "nombres": row_attr(row, "nombres", 8),
+            "iniciales": row_attr(row, "iniciales", 9),
+        }
+        docentes.append(prepare_docente_reference_entry(docente))
 
     return docentes
 
@@ -708,26 +768,39 @@ def split_authors_with_affiliations_blocks(
 def parse_scopus_author_name(scopus_author_name: str) -> dict:
     raw = clean_author_full_name(scopus_author_name)
 
+    family_tokens: list[str] = []
+    given_tokens: list[str] = []
+
     if "," in raw:
         family_part, given_part = [p.strip() for p in raw.split(",", 1)]
+        family_tokens = [t for t in normalize_generic_text(family_part).split() if t]
+        given_tokens = [t for t in normalize_generic_text(given_part.replace(".", " ")).split() if t]
     else:
         tokens = [t.strip() for t in raw.replace(".", " ").split() if t.strip()]
-        if len(tokens) >= 2:
-            family_part = " ".join(tokens[:-1])
-            given_part = tokens[-1]
-        else:
-            family_part = raw
-            given_part = ""
+        normalized_tokens = [normalize_generic_text(t) for t in tokens]
 
-    family_tokens = [t for t in normalize_generic_text(family_part).split() if t]
-    given_tokens = [t for t in normalize_generic_text(given_part.replace(".", " ")).split() if t]
+        trailing_initials: list[str] = []
+        idx = len(normalized_tokens) - 1
+        while idx >= 0 and len(normalized_tokens[idx]) == 1:
+            trailing_initials.insert(0, normalized_tokens[idx])
+            idx -= 1
+
+        if trailing_initials and idx >= 0:
+            family_tokens = normalized_tokens[:idx + 1]
+            given_tokens = trailing_initials
+        elif len(normalized_tokens) >= 2:
+            family_tokens = normalized_tokens[:-1]
+            given_tokens = [normalized_tokens[-1]]
+        else:
+            family_tokens = normalized_tokens
+            given_tokens = []
 
     apellido_1 = family_tokens[0] if family_tokens else None
     apellido_2 = " ".join(family_tokens[1:]) if len(family_tokens) > 1 else None
-    initials = "".join(token[0].upper() for token in given_tokens if token)
-
-    normalized_full = normalize_person_name(f"{family_part} {given_part}")
-    family_signature = " ".join(family_tokens)
+    initials = "".join(token[0] for token in given_tokens if token)
+    normalized_full = normalize_person_name(raw)
+    family_signature = " ".join(family_tokens).strip()
+    first_name = given_tokens[0] if given_tokens else ""
 
     return {
         "raw": raw,
@@ -737,7 +810,35 @@ def parse_scopus_author_name(scopus_author_name: str) -> dict:
         "family_signature": family_signature,
         "given_tokens": given_tokens,
         "initials": initials,
+        "first_name": first_name,
         "normalized_full": normalized_full,
+    }
+
+
+def build_scopus_author_aliases(parsed: dict) -> dict:
+    strong_aliases: set[str] = set()
+    weak_aliases: set[str] = set()
+
+    if parsed["normalized_full"]:
+        strong_aliases.add(parsed["normalized_full"])
+
+    initials_variants = initials_variants_from_tokens(parsed["given_tokens"])
+
+    if parsed["family_signature"]:
+        for iv in initials_variants:
+            strong_aliases.add(f"{parsed['family_signature']} {iv}".strip())
+        if parsed["first_name"]:
+            strong_aliases.add(f"{parsed['family_signature']} {parsed['first_name']}".strip())
+
+    if parsed["apellido_1"]:
+        for iv in initials_variants:
+            weak_aliases.add(f"{parsed['apellido_1']} {iv}".strip())
+        if parsed["first_name"]:
+            weak_aliases.add(f"{parsed['apellido_1']} {parsed['first_name']}".strip())
+
+    return {
+        "strong_aliases": {a for a in strong_aliases if a},
+        "weak_aliases": {a for a in weak_aliases if a},
     }
 
 
@@ -747,12 +848,10 @@ def given_names_match(ref_nombres: str | None, scopus_given_tokens: list[str], s
     if not scopus_given_tokens and not scopus_initials:
         return True
 
-    # caso de iniciales, por ejemplo S. / J. M.
     if scopus_initials and (not scopus_given_tokens or all(len(tok) == 1 for tok in scopus_given_tokens)):
-        ref_initials = "".join(token[0].upper() for token in ref_tokens if token)
+        ref_initials = "".join(token[0] for token in ref_tokens if token)
         return ref_initials.startswith(scopus_initials)
 
-    # caso de nombres escritos, exigir prefijo exacto ordenado
     if scopus_given_tokens:
         if len(ref_tokens) < len(scopus_given_tokens):
             return False
@@ -771,14 +870,49 @@ def filter_candidates_by_career_hint(candidates: list[dict], career_hint: str | 
     return filtered if filtered else candidates
 
 
+def unique_alias_match(
+    scopus_aliases: set[str],
+    docentes_ref: list[dict],
+    alias_key: str,
+    career_hint: str | None = None
+) -> dict:
+    candidates = []
+    for docente in docentes_ref:
+        if scopus_aliases.intersection(docente.get(alias_key, set())):
+            candidates.append(docente)
+
+    candidates = filter_candidates_by_career_hint(candidates, career_hint)
+
+    if len(candidates) == 1:
+        return {
+            "matched": True,
+            "ambiguous": False,
+            "docente": candidates[0],
+        }
+
+    if len(candidates) > 1:
+        return {
+            "matched": False,
+            "ambiguous": True,
+            "docente": None,
+        }
+
+    return {
+        "matched": False,
+        "ambiguous": False,
+        "docente": None,
+    }
+
+
 def match_scopus_author_to_docente(
     scopus_author_name: str,
     docentes_ref: list[dict],
     career_hint: str | None = None
 ) -> dict:
     parsed = parse_scopus_author_name(scopus_author_name)
+    scopus_aliases = build_scopus_author_aliases(parsed)
 
-    # 1) match exacto por nombre normalizado completo
+    # 1) exacto por nombre normalizado completo
     exact_matches = [
         d for d in docentes_ref
         if d["nombre_normalizado"] == parsed["normalized_full"]
@@ -804,8 +938,8 @@ def match_scopus_author_to_docente(
     # 2) match estructural exacto por apellido1 + apellido2 + nombres/iniciales
     structured_matches = []
     for docente in docentes_ref:
-        ref_ap1 = normalize_generic_text(docente.get("apellido_1"))
-        ref_ap2 = normalize_generic_text(docente.get("apellido_2"))
+        ref_ap1 = docente.get("apellido_1_norm")
+        ref_ap2 = docente.get("apellido_2_norm")
 
         if parsed["apellido_1"] and ref_ap1 != parsed["apellido_1"]:
             continue
@@ -836,37 +970,49 @@ def match_scopus_author_to_docente(
             "docente": None,
         }
 
-    # 3) fallback controlado: un solo apellido + nombres/iniciales, solo si queda único
-    if parsed["apellido_1"]:
-        single_surname_matches = []
-        for docente in docentes_ref:
-            ref_ap1 = normalize_generic_text(docente.get("apellido_1"))
-            ref_ap2 = normalize_generic_text(docente.get("apellido_2"))
+    # 3) alias fuerte (apellido1 apellido2 + iniciales / nombre)
+    strong_match = unique_alias_match(
+        scopus_aliases=scopus_aliases["strong_aliases"],
+        docentes_ref=docentes_ref,
+        alias_key="strong_aliases",
+        career_hint=career_hint
+    )
+    if strong_match["matched"]:
+        return {
+            "matched": True,
+            "ambiguous": False,
+            "match_method": "DOCENTES_REF_ALIAS_STRONG",
+            "docente": strong_match["docente"],
+        }
+    if strong_match["ambiguous"]:
+        return {
+            "matched": False,
+            "ambiguous": True,
+            "match_method": "DOCENTES_REF_ALIAS_STRONG_AMBIGUOUS",
+            "docente": None,
+        }
 
-            if ref_ap1 != parsed["apellido_1"] and ref_ap2 != parsed["apellido_1"]:
-                continue
-            if not given_names_match(docente.get("nombres"), parsed["given_tokens"], parsed["initials"]):
-                continue
-
-            single_surname_matches.append(docente)
-
-        single_surname_matches = filter_candidates_by_career_hint(single_surname_matches, career_hint)
-
-        if len(single_surname_matches) == 1:
-            return {
-                "matched": True,
-                "ambiguous": False,
-                "match_method": "DOCENTES_REF_SURNAME_INITIAL",
-                "docente": single_surname_matches[0],
-            }
-
-        if len(single_surname_matches) > 1:
-            return {
-                "matched": False,
-                "ambiguous": True,
-                "match_method": "DOCENTES_REF_SURNAME_INITIAL_AMBIGUOUS",
-                "docente": None,
-            }
+    # 4) alias débil (apellido1 + iniciales / nombre), solo si queda único
+    weak_match = unique_alias_match(
+        scopus_aliases=scopus_aliases["weak_aliases"],
+        docentes_ref=docentes_ref,
+        alias_key="weak_aliases",
+        career_hint=career_hint
+    )
+    if weak_match["matched"]:
+        return {
+            "matched": True,
+            "ambiguous": False,
+            "match_method": "DOCENTES_REF_ALIAS_WEAK",
+            "docente": weak_match["docente"],
+        }
+    if weak_match["ambiguous"]:
+        return {
+            "matched": False,
+            "ambiguous": True,
+            "match_method": "DOCENTES_REF_ALIAS_WEAK_AMBIGUOUS",
+            "docente": None,
+        }
 
     return {
         "matched": False,

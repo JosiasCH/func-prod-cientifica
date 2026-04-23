@@ -770,6 +770,32 @@ def split_authors_with_affiliations_blocks(
     return blocks
 
 
+def extract_author_name_from_block(block: str | None) -> str | None:
+    if not block:
+        return None
+
+    first_part = str(block).split(",", 1)[0].strip()
+    if not first_part:
+        return None
+
+    return clean_author_full_name(first_part)
+
+
+def get_preferred_author_name_for_block(
+    idx: int,
+    full_authors: list[str],
+    short_authors: list[str],
+    block: str | None
+) -> str | None:
+    if idx < len(full_authors) and full_authors[idx]:
+        return clean_author_full_name(full_authors[idx])
+
+    if idx < len(short_authors) and short_authors[idx]:
+        return clean_author_full_name(short_authors[idx])
+
+    return extract_author_name_from_block(block)
+
+
 def parse_scopus_author_name(scopus_author_name: str) -> dict:
     raw = clean_author_full_name(scopus_author_name)
 
@@ -1056,7 +1082,7 @@ def enrich_ulima_fields_from_ref(
 
     publication_level_careers = get_publication_level_engineering_careers(affiliations_value)
 
-    matched_docentes: list[str] = []
+    ulima_authors_detected: list[str] = []
     publication_careers: list[str] = []
     first_author_ulima = False
     matched_any = False
@@ -1068,25 +1094,32 @@ def enrich_ulima_fields_from_ref(
 
         affiliation_ulima_detected = True
 
+        preferred_author_name = get_preferred_author_name_for_block(
+            idx=idx,
+            full_authors=full_authors,
+            short_authors=short_authors,
+            block=block,
+        )
+        if preferred_author_name:
+            ulima_authors_detected.append(preferred_author_name)
+
+        if idx == 0:
+            first_author_ulima = True
+
         block_careers = get_block_engineering_careers(
             block_value=block,
             publication_level_careers=publication_level_careers,
         )
-
-        if idx == 0 and block_careers:
-            first_author_ulima = True
 
         if idx < len(full_authors):
             scopus_author_name = full_authors[idx]
         elif idx < len(short_authors):
             scopus_author_name = short_authors[idx]
         else:
-            scopus_author_name = block.split(",", 2)[0].strip()
+            scopus_author_name = extract_author_name_from_block(block) or ""
 
-        # Paso 1: carrera por afiliación
         resolved_career_hint = block_careers[0] if len(block_careers) == 1 else None
 
-        # Paso 2: si afiliación no resolvió carrera, fallback con docente normalizado
         match_result = match_scopus_author_to_docente(
             scopus_author_name=scopus_author_name,
             docentes_ref=docentes_ref,
@@ -1096,10 +1129,6 @@ def enrich_ulima_fields_from_ref(
         if match_result["matched"]:
             matched_any = True
             docente = match_result["docente"]
-            display_name = build_docente_display_name(docente)
-
-            if display_name and display_name not in matched_docentes:
-                matched_docentes.append(display_name)
 
             if not block_careers and docente.get("carrera"):
                 block_careers = [docente.get("carrera")]
@@ -1110,6 +1139,7 @@ def enrich_ulima_fields_from_ref(
         publication_careers.extend(publication_level_careers)
 
     publication_careers = unique_keep_order([c for c in publication_careers if c])
+    ulima_authors_detected = unique_keep_order([a for a in ulima_authors_detected if a])
 
     if matched_any and publication_careers:
         metodo = "AFFILIATION+DOCENTES_REF"
@@ -1121,7 +1151,7 @@ def enrich_ulima_fields_from_ref(
         metodo = None
 
     return {
-        "ulima_docentes_raw": "; ".join(matched_docentes) if matched_docentes else None,
+        "ulima_docentes_raw": "; ".join(ulima_authors_detected) if ulima_authors_detected else None,
         "first_author_ulima_raw": "True" if first_author_ulima else "False",
         "carrera_raw": "; ".join(publication_careers) if publication_careers else None,
         "metodo_cruce_scopus_raw": metodo,

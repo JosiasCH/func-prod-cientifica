@@ -4,8 +4,6 @@ import os
 from datetime import datetime, timezone
 
 import azure.functions as func
-from azure.storage.blob import BlobServiceClient
-from mssql_python import connect
 
 app = func.FunctionApp(http_auth_level=func.AuthLevel.FUNCTION)
 
@@ -34,7 +32,8 @@ def build_sql_connection_string() -> str:
     )
 
 
-def get_blob_service() -> BlobServiceClient:
+def get_blob_service():
+    from azure.storage.blob import BlobServiceClient
     conn_str = get_env("DATA_STORAGE_CONNECTION_STRING")
     return BlobServiceClient.from_connection_string(conn_str)
 
@@ -54,13 +53,13 @@ def validate_containers() -> dict:
 
 
 def insert_pipeline_run(trigger_type: str, status: str, source_name: str = "FUNCTION_SMOKE") -> int:
-    pipeline_name = os.environ.get("PIPELINE_NAME", "scopus_monthly_pipeline")
+    from mssql_python import connect
 
+    pipeline_name = os.environ.get("PIPELINE_NAME", "scopus_monthly_pipeline")
     sql_conn_str = build_sql_connection_string()
 
     with connect(sql_conn_str) as conn:
         cursor = conn.cursor()
-
         cursor.execute(
             """
             INSERT INTO meta.pipeline_runs (
@@ -126,14 +125,7 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as exc:
         logging.exception("Health check failed")
         return func.HttpResponse(
-            json.dumps(
-                {
-                    "status": "error",
-                    "message": str(exc),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False, indent=2),
             status_code=500,
             mimetype="application/json",
         )
@@ -162,14 +154,7 @@ def run_smoke(req: func.HttpRequest) -> func.HttpResponse:
     except Exception as exc:
         logging.exception("Smoke run failed")
         return func.HttpResponse(
-            json.dumps(
-                {
-                    "status": "error",
-                    "message": str(exc),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
+            json.dumps({"status": "error", "message": str(exc)}, ensure_ascii=False, indent=2),
             status_code=500,
             mimetype="application/json",
         )

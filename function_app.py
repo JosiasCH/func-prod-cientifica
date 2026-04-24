@@ -29,6 +29,7 @@ def get_sql_connection_string() -> str:
 
 def get_blob_service():
     from azure.storage.blob import BlobServiceClient
+
     conn_str = get_env("DATA_STORAGE_CONNECTION_STRING")
     return BlobServiceClient.from_connection_string(conn_str)
 
@@ -136,7 +137,7 @@ def derive_conference_journal_value(document_type_value: str | None) -> str | No
 
 def derive_revista_and_conference(
     source_title_value: str | None,
-    document_type_value: str | None
+    document_type_value: str | None,
 ) -> tuple[str | None, str | None]:
     if not source_title_value:
         return None, None
@@ -149,7 +150,7 @@ def derive_revista_and_conference(
 
 def build_authors_display(
     author_full_names_value: str | None,
-    authors_value: str | None
+    authors_value: str | None,
 ) -> str | None:
     full_names = [clean_author_full_name(x) for x in split_semicolon_values(author_full_names_value)]
     full_names = [x for x in full_names if x]
@@ -203,6 +204,65 @@ def choose_best_scored_candidate(score_map: dict[str, int], min_score: int = 1) 
         return None
 
     return best_key
+
+
+def clip_text(value: str | None, max_chars: int = 7000) -> str | None:
+    if not value:
+        return None
+    value = str(value).strip()
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars]
+
+
+def coerce_choice(value: str | None, allowed_values: list[str]) -> str | None:
+    if not value:
+        return None
+
+    norm_value = normalize_generic_text(value)
+    if not norm_value:
+        return None
+
+    for allowed in allowed_values:
+        if normalize_generic_text(allowed) == norm_value:
+            return allowed
+
+    return None
+
+
+def parse_float_or_none(value) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def extract_json_object(text: str | None) -> dict | None:
+    if not text:
+        return None
+
+    candidate = str(text).strip()
+    if candidate.startswith("```"):
+        candidate = re.sub(r"^```(?:json)?", "", candidate.strip(), flags=re.IGNORECASE).strip()
+        candidate = re.sub(r"```$", "", candidate.strip()).strip()
+
+    try:
+        loaded = json.loads(candidate)
+        return loaded if isinstance(loaded, dict) else None
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+    if not match:
+        return None
+
+    try:
+        loaded = json.loads(match.group(0))
+        return loaded if isinstance(loaded, dict) else None
+    except Exception:
+        return None
 
 
 # =========================
@@ -515,7 +575,7 @@ def get_allowed_idic_areas(category_tematica: str | None = None) -> list[str]:
 
 def get_allowed_idic_lines(
     category_tematica: str | None = None,
-    area_idic: str | None = None
+    area_idic: str | None = None,
 ) -> list[str]:
     if category_tematica and area_idic:
         return list(IDIC_CATEGORY_AREA_LINE_CATALOG.get(category_tematica, {}).get(area_idic, []))
@@ -536,7 +596,6 @@ def get_allowed_idic_lines(
 def coerce_area_carrera_from_linea(carrera: str | None, linea_carrera: str | None) -> str | None:
     if not carrera or not linea_carrera:
         return None
-
     return CAREER_LINE_TO_AREA_MAP.get(carrera, {}).get(normalize_generic_text(linea_carrera))
 
 
@@ -555,395 +614,163 @@ def coerce_area_idic_from_linea(linea_idic: str | None) -> str | None:
 def is_valid_career_area_line(
     carrera: str | None,
     area_carrera: str | None,
-    linea_carrera: str | None
+    linea_carrera: str | None,
 ) -> bool:
     if not carrera or not area_carrera or not linea_carrera:
         return False
-
     return linea_carrera in CAREER_AREA_LINE_CATALOG.get(carrera, {}).get(area_carrera, [])
 
 
 def is_valid_idic_triplet(
     category_tematica: str | None,
     area_idic: str | None,
-    linea_idic: str | None
+    linea_idic: str | None,
 ) -> bool:
     if not category_tematica or not area_idic or not linea_idic:
         return False
-
     return linea_idic in IDIC_CATEGORY_AREA_LINE_CATALOG.get(category_tematica, {}).get(area_idic, [])
 
 
 # =========================
-# CLASSIFICATION HINTS
+# CLASSIFICATION HINTS (fallback)
 # =========================
 CAREER_LINE_HINTS = {
     "Ingeniería Industrial": {
-        "Diseño de sistemas de trabajo": [
-            "diseno de sistemas de trabajo", "work design", "work system design",
-        ],
-        "Evaluación de factores físicos": [
-            "factores fisicos", "physical factors",
-        ],
-        "Evaluación ergonómica": [
-            "ergonomia", "ergonomic", "ergonomics",
-        ],
+        "Diseño de sistemas de trabajo": ["diseno de sistemas de trabajo", "work design", "work system design"],
+        "Evaluación de factores físicos": ["factores fisicos", "physical factors"],
+        "Evaluación ergonómica": ["ergonomia", "ergonomic", "ergonomics"],
         "Modelamiento matemático a la mejora de procesos como soporte a la toma de decisiones": [
-            "modelamiento matematico", "mathematical modeling", "decision making",
+            "modelamiento matematico", "mathematical modeling", "decision making"
         ],
-        "Simulación para la mejora del diseño de procesos": [
-            "simulacion", "simulation", "process simulation",
-        ],
+        "Simulación para la mejora del diseño de procesos": ["simulacion", "simulation", "process simulation"],
         "Diseño y desarrollo de modelos para el análisis y predicción de las variables de un proceso": [
-            "prediccion", "prediction", "forecasting", "analisis de variables",
+            "prediccion", "prediction", "forecasting", "analisis de variables"
         ],
-        "Planeamiento y Gestión de Operaciones": [
-            "operations management", "gestion de operaciones", "planeamiento de operaciones",
-        ],
-        "Planeamiento, programación y control de proyectos": [
-            "project scheduling", "project control", "programacion y control de proyectos",
-        ],
-        "Gestión de mantenimiento": [
-            "mantenimiento", "maintenance management",
-        ],
-        "Gestión de la cadena de suministro": [
-            "supply chain", "cadena de suministro",
-        ],
-        "Gestión de Logística Inversa": [
-            "logistica inversa", "reverse logistics",
-        ],
-        "Gestión de Inventarios, Almacenes y Transportes": [
-            "inventarios", "almacenes", "transportes", "inventory", "warehouse", "transportation",
-        ],
+        "Planeamiento y Gestión de Operaciones": ["operations management", "gestion de operaciones", "planeamiento de operaciones"],
+        "Planeamiento, programación y control de proyectos": ["project scheduling", "project control", "programacion y control de proyectos"],
+        "Gestión de mantenimiento": ["mantenimiento", "maintenance management"],
+        "Gestión de la cadena de suministro": ["supply chain", "cadena de suministro"],
+        "Gestión de Logística Inversa": ["logistica inversa", "reverse logistics"],
+        "Gestión de Inventarios, Almacenes y Transportes": ["inventarios", "almacenes", "transportes", "inventory", "warehouse", "transportation"],
         "Gestión de compras y proveedores, Nivel de servicio y Satisfacción al cliente": [
-            "compras", "proveedores", "nivel de servicio", "satisfaccion al cliente", "supplier", "service level",
+            "compras", "proveedores", "nivel de servicio", "satisfaccion al cliente", "supplier", "service level"
         ],
-        "Gestión de riesgos ocupacionales": [
-            "riesgos ocupacionales", "occupational risks",
-        ],
+        "Gestión de riesgos ocupacionales": ["riesgos ocupacionales", "occupational risks"],
         "Identificación, análisis, evaluación y control de riesgos en seguridad y salud ocupacional": [
-            "seguridad y salud ocupacional", "occupational health", "occupational safety",
+            "seguridad y salud ocupacional", "occupational health", "occupational safety"
         ],
-        "Diseño de producto": [
-            "diseno de producto", "product design",
-        ],
-        "Desarrollo de producto": [
-            "desarrollo de producto", "product development",
-        ],
+        "Diseño de producto": ["diseno de producto", "product design"],
+        "Desarrollo de producto": ["desarrollo de producto", "product development"],
     },
     "Ingeniería Civil": {
-        "Ecuaciones diferenciales aplicadas al análisis estructural": [
-            "analisis estructural", "structural analysis", "ecuaciones diferenciales",
-        ],
-        "Física de materiales": [
-            "fisica de materiales", "materials physics",
-        ],
-        "Metodología BIM": [
-            "bim", "building information modeling",
-        ],
-        "Normativa BIM": [
-            "normativa bim", "bim standard", "bim standards",
-        ],
-        "Materiales de Construcción": [
-            "materiales de construccion", "construction materials",
-        ],
-        "Sostenibilidad": [
-            "sostenibilidad", "sustainability",
-        ],
-        "Innovación en Proceso constructivos": [
-            "proceso constructivo", "construction process innovation",
-        ],
-        "Tecnología": [
-            "tecnologia en construccion", "construction technology",
-        ],
-        "Técnicas de experimentación en estructuras": [
-            "experimental structures", "experimentacion en estructuras",
-        ],
-        "Vulnerabilidad sísmica de estructuras": [
-            "vulnerabilidad sismica", "seismic vulnerability",
-        ],
-        "Sistemas de protección sísmica de estructuras": [
-            "proteccion sismica", "seismic protection", "base isolation",
-        ],
-        "Obras de Construcción y su relación con el medio ambiente": [
-            "medio ambiente", "environmental impact", "construction and environment",
-        ],
-        "Hidrología e Hidráulica": [
-            "hidrologia", "hidraulica", "hydrology", "hydraulics",
-        ],
-        "Riego y Drenaje": [
-            "riego", "drenaje", "irrigation", "drainage",
-        ],
-        "Calidad del Agua": [
-            "calidad del agua", "water quality",
-        ],
-        "Cambio Climático en Recursos Hídricos": [
-            "cambio climatico", "climate change", "recursos hidricos", "water resources",
-        ],
-        "Transporte de Sedimentos": [
-            "sedimentos", "sediment transport",
-        ],
-        "Hidrogeología": [
-            "hidrogeologia", "hydrogeology",
-        ],
-        "Geotecnia computacional": [
-            "geotecnia computacional", "computational geotechnics",
-        ],
-        "Geotecnia ambiental e hidrogeología": [
-            "geotecnia ambiental", "environmental geotechnics",
-        ],
-        "Geotecnia experimental": [
-            "geotecnia experimental", "experimental geotechnics",
-        ],
-        "Geotecnia minera": [
-            "geotecnia minera", "mining geotechnics",
-        ],
-        "Mecánica de rocas e ingeniería geológica": [
-            "mecanica de rocas", "rock mechanics", "ingenieria geologica",
-        ],
-        "Tecnologia de mezclas asfalticas": [
-            "mezclas asfalticas", "asphalt mixtures",
-        ],
-        "Diseño estructural de Pavimentos": [
-            "pavimentos", "pavement design",
-        ],
-        "Mejora y estabilización del suelo": [
-            "estabilizacion del suelo", "soil stabilization", "mejora del suelo",
-        ],
-        "Cambio climatico en la infraestructura vial": [
-            "infraestructura vial", "road infrastructure", "climate change in transport infrastructure",
-        ],
-        "Gestion de riesgos geológicos": [
-            "riesgos geologicos", "geological risks",
-        ],
-        "Gestión de riesgos": [
-            "gestion de riesgos", "risk management",
-        ],
-        "Gestión estratégica de contratos": [
-            "contratos", "contract management",
-        ],
-        "Gestión de las comunicaciones": [
-            "communications management", "gestion de las comunicaciones",
-        ],
-        "Gestión de recursos": [
-            "resource management", "gestion de recursos",
-        ],
+        "Ecuaciones diferenciales aplicadas al análisis estructural": ["analisis estructural", "structural analysis", "ecuaciones diferenciales"],
+        "Física de materiales": ["fisica de materiales", "materials physics"],
+        "Metodología BIM": ["bim", "building information modeling"],
+        "Normativa BIM": ["normativa bim", "bim standard", "bim standards"],
+        "Materiales de Construcción": ["materiales de construccion", "construction materials"],
+        "Sostenibilidad": ["sostenibilidad", "sustainability"],
+        "Innovación en Proceso constructivos": ["proceso constructivo", "construction process innovation"],
+        "Tecnología": ["tecnologia en construccion", "construction technology"],
+        "Técnicas de experimentación en estructuras": ["experimental structures", "experimentacion en estructuras"],
+        "Vulnerabilidad sísmica de estructuras": ["vulnerabilidad sismica", "seismic vulnerability"],
+        "Sistemas de protección sísmica de estructuras": ["proteccion sismica", "seismic protection", "base isolation"],
+        "Obras de Construcción y su relación con el medio ambiente": ["medio ambiente", "environmental impact", "construction and environment"],
+        "Hidrología e Hidráulica": ["hidrologia", "hidraulica", "hydrology", "hydraulics"],
+        "Riego y Drenaje": ["riego", "drenaje", "irrigation", "drainage"],
+        "Calidad del Agua": ["calidad del agua", "water quality"],
+        "Cambio Climático en Recursos Hídricos": ["cambio climatico", "climate change", "recursos hidricos", "water resources"],
+        "Transporte de Sedimentos": ["sedimentos", "sediment transport"],
+        "Hidrogeología": ["hidrogeologia", "hydrogeology"],
+        "Geotecnia computacional": ["geotecnia computacional", "computational geotechnics"],
+        "Geotecnia ambiental e hidrogeología": ["geotecnia ambiental", "environmental geotechnics"],
+        "Geotecnia experimental": ["geotecnia experimental", "experimental geotechnics"],
+        "Geotecnia minera": ["geotecnia minera", "mining geotechnics"],
+        "Mecánica de rocas e ingeniería geológica": ["mecanica de rocas", "rock mechanics", "ingenieria geologica"],
+        "Tecnologia de mezclas asfalticas": ["mezclas asfalticas", "asphalt mixtures"],
+        "Diseño estructural de Pavimentos": ["pavimentos", "pavement design"],
+        "Mejora y estabilización del suelo": ["estabilizacion del suelo", "soil stabilization", "mejora del suelo"],
+        "Cambio climatico en la infraestructura vial": ["infraestructura vial", "road infrastructure", "climate change in transport infrastructure"],
+        "Gestion de riesgos geológicos": ["riesgos geologicos", "geological risks"],
+        "Gestión de riesgos": ["gestion de riesgos", "risk management"],
+        "Gestión estratégica de contratos": ["contratos", "contract management"],
+        "Gestión de las comunicaciones": ["communications management", "gestion de las comunicaciones"],
+        "Gestión de recursos": ["resource management", "gestion de recursos"],
     },
     "Ingeniería de Sistemas": {
-        "Visión computacional": [
-            "vision computacional", "computer vision",
-        ],
-        "NLP": [
-            "nlp", "natural language processing", "procesamiento de lenguaje natural",
-        ],
-        "Aprendizaje automático": [
-            "aprendizaje automatico", "machine learning",
-        ],
-        "Minería de datos": [
-            "mineria de datos", "data mining",
-        ],
-        "Seguridad de sistemas y aplicaciones": [
-            "seguridad de sistemas", "application security", "systems security",
-        ],
-        "IoT": [
-            "iot", "internet of things",
-        ],
-        "Computación de alto rendimiento": [
-            "high performance computing", "computacion de alto rendimiento", "hpc",
-        ],
-        "Redes y ciberseguridad": [
-            "ciberseguridad", "cybersecurity", "networks", "redes",
-        ],
-        "Sostenibilidad en TI": [
-            "sostenibilidad en ti", "green it",
-        ],
-        "HCI": [
-            "hci", "human computer interaction", "interaccion humano computadora",
-        ],
-        "Realidad virtual y aumentada": [
-            "realidad virtual", "realidad aumentada", "virtual reality", "augmented reality",
-        ],
-        "Construcción de juegos y gamificación": [
-            "gamification", "gamificacion", "game development", "juegos",
-        ],
-        "Agentes virtuales": [
-            "virtual agents", "agentes virtuales", "chatbot", "chatbots",
-        ],
-        "Optimización computacional": [
-            "optimizacion computacional", "computational optimization",
-        ],
-        "Ingeniería de software": [
-            "ingenieria de software", "software engineering",
-        ],
-        "Diseño de algoritmos": [
-            "diseno de algoritmos", "algorithm design",
-        ],
-        "Gestión de procesos tecnológicos": [
-            "procesos tecnologicos", "technology process management",
-        ],
-        "Liderazgo, género y tecnología": [
-            "genero y tecnologia", "gender and technology", "liderazgo y tecnologia",
-        ],
-        "Sistemas de gestión del conocimiento": [
-            "gestion del conocimiento", "knowledge management systems",
-        ],
-        "Minería de procesos": [
-            "mineria de procesos", "process mining",
-        ],
-        "Computación aplicada": [
-            "computacion aplicada", "applied computing",
-        ],
-        "Simulación de procesos": [
-            "simulacion de procesos", "process simulation",
-        ],
+        "Visión computacional": ["vision computacional", "computer vision"],
+        "NLP": ["nlp", "natural language processing", "procesamiento de lenguaje natural"],
+        "Aprendizaje automático": ["aprendizaje automatico", "machine learning"],
+        "Minería de datos": ["mineria de datos", "data mining"],
+        "Seguridad de sistemas y aplicaciones": ["seguridad de sistemas", "application security", "systems security"],
+        "IoT": ["iot", "internet of things"],
+        "Computación de alto rendimiento": ["high performance computing", "computacion de alto rendimiento", "hpc"],
+        "Redes y ciberseguridad": ["ciberseguridad", "cybersecurity", "networks", "redes"],
+        "Sostenibilidad en TI": ["sostenibilidad en ti", "green it"],
+        "HCI": ["hci", "human computer interaction", "interaccion humano computadora"],
+        "Realidad virtual y aumentada": ["realidad virtual", "realidad aumentada", "virtual reality", "augmented reality"],
+        "Construcción de juegos y gamificación": ["gamification", "gamificacion", "game development", "juegos"],
+        "Agentes virtuales": ["virtual agents", "agentes virtuales", "chatbot", "chatbots"],
+        "Optimización computacional": ["optimizacion computacional", "computational optimization"],
+        "Ingeniería de software": ["ingenieria de software", "software engineering"],
+        "Diseño de algoritmos": ["diseno de algoritmos", "algorithm design"],
+        "Gestión de procesos tecnológicos": ["procesos tecnologicos", "technology process management"],
+        "Liderazgo, género y tecnología": ["genero y tecnologia", "gender and technology", "liderazgo y tecnologia"],
+        "Sistemas de gestión del conocimiento": ["gestion del conocimiento", "knowledge management systems"],
+        "Minería de procesos": ["mineria de procesos", "process mining"],
+        "Computación aplicada": ["computacion aplicada", "applied computing"],
+        "Simulación de procesos": ["simulacion de procesos", "process simulation"],
     },
 }
 
 IDIC_LINE_HINTS = {
-    "Machine learning y deep learning": [
-        "machine learning", "deep learning", "aprendizaje automatico",
-    ],
-    "Procesamiento de lenguaje natural": [
-        "natural language processing", "procesamiento de lenguaje natural", "nlp",
-    ],
-    "Visión computacional": [
-        "computer vision", "vision computacional",
-    ],
-    "Sistemas autónomos y robótica": [
-        "robotica", "robotics", "autonomous systems",
-    ],
-    "Tecnologías emergentes": [
-        "tecnologias emergentes", "emerging technologies",
-    ],
-    "Ciberseguridad y privacidad": [
-        "ciberseguridad", "cybersecurity", "privacy", "privacidad",
-    ],
-    "Internet de las cosas (IoT)": [
-        "internet of things", "iot",
-    ],
-    "Computación cuántica": [
-        "computacion cuantica", "quantum computing",
-    ],
-    "Diseño y construcción virtual": [
-        "construccion virtual", "virtual construction", "bim",
-    ],
-    "Interacción humano-computadora": [
-        "human computer interaction", "interaccion humano computadora", "hci",
-    ],
-    "Realidad virtual y aumentada": [
-        "virtual reality", "augmented reality", "realidad virtual", "realidad aumentada",
-    ],
-    "Diseño de interfaces adaptativas": [
-        "adaptive interfaces", "interfaces adaptativas",
-    ],
-    "Energías renovables": [
-        "energias renovables", "renewable energy",
-    ],
-    "Economía circular": [
-        "economia circular", "circular economy",
-    ],
-    "Gestión sostenible de recursos": [
-        "gestion sostenible de recursos", "sustainable resource management",
-    ],
-    "Adaptación al cambio climático": [
-        "adaptacion al cambio climatico", "climate adaptation",
-    ],
-    "Urbanismo sostenible": [
-        "urbanismo sostenible", "sustainable urbanism",
-    ],
-    "Movilidad urbana": [
-        "movilidad urbana", "urban mobility",
-    ],
-    "Infraestructura sostenible": [
-        "infraestructura sostenible", "sustainable infrastructure",
-    ],
-    "Gestión inteligente de recursos": [
-        "smart resource management", "gestion inteligente de recursos",
-    ],
-    "Tecnologías limpias": [
-        "tecnologias limpias", "clean technologies",
-    ],
-    "Biodiversidad y conservación": [
-        "biodiversidad", "conservacion", "biodiversity", "conservation",
-    ],
-    "Gestión de residuos": [
-        "gestion de residuos", "waste management",
-    ],
-    "Materiales avanzados": [
-        "materiales avanzados", "advanced materials",
-    ],
-    "Salud mental y bienestar": [
-        "salud mental", "mental health", "wellbeing", "bienestar",
-    ],
-    "Educación, desarrollo cognitivo y socioafectivo": [
-        "educacion", "education", "desarrollo cognitivo", "socioafectivo",
-    ],
-    "Comportamiento social": [
-        "comportamiento social", "social behavior",
-    ],
-    "Mujer, cultura y sociedad": [
-        "mujer", "woman", "women", "culture and society", "cultura y sociedad",
-    ],
-    "Pobreza e informalidad": [
-        "pobreza", "poverty", "informalidad", "informality",
-    ],
-    "Medios digitales y sociedad": [
-        "medios digitales", "digital media", "society",
-    ],
-    "Comunicación intercultural": [
-        "comunicacion intercultural", "intercultural communication",
-    ],
-    "Narrativas transmedia": [
-        "narrativas transmedia", "transmedia narratives",
-    ],
-    "Comportamiento digital": [
-        "comportamiento digital", "digital behavior",
-    ],
-    "Ética y gobernanza": [
-        "etica", "ethics", "governance", "gobernanza",
-    ],
-    "Responsabilidad social": [
-        "responsabilidad social", "social responsibility",
-    ],
-    "Derechos humanos y tecnología": [
-        "derechos humanos", "human rights", "technology",
-    ],
-    "Modelos de negocio digitales": [
-        "modelos de negocio digitales", "digital business models",
-    ],
-    "Emprendimiento tecnológico": [
-        "emprendimiento tecnologico", "technology entrepreneurship",
-    ],
-    "Gestión de la innovación": [
-        "gestion de la innovacion", "innovation management",
-    ],
-    "Transformación organizacional": [
-        "transformacion organizacional", "organizational transformation",
-    ],
-    "Fintech y servicios financieros": [
-        "fintech", "financial services", "servicios financieros",
-    ],
-    "Mercados globales": [
-        "mercados globales", "global markets",
-    ],
-    "Análisis de datos económicos": [
-        "analisis de datos economicos", "economic data analysis",
-    ],
-    "Economía de plataformas": [
-        "economia de plataformas", "platform economy",
-    ],
-    "Gestión del capital intelectual": [
-        "capital intelectual", "intellectual capital",
-    ],
-    "Aprendizaje organizacional": [
-        "aprendizaje organizacional", "organizational learning",
-    ],
-    "Transferencia de conocimiento": [
-        "transferencia de conocimiento", "knowledge transfer",
-    ],
-    "Inteligencia de negocios": [
-        "inteligencia de negocios", "business intelligence",
-    ],
+    "Machine learning y deep learning": ["machine learning", "deep learning", "aprendizaje automatico"],
+    "Procesamiento de lenguaje natural": ["natural language processing", "procesamiento de lenguaje natural", "nlp"],
+    "Visión computacional": ["computer vision", "vision computacional"],
+    "Sistemas autónomos y robótica": ["robotica", "robotics", "autonomous systems"],
+    "Tecnologías emergentes": ["tecnologias emergentes", "emerging technologies"],
+    "Ciberseguridad y privacidad": ["ciberseguridad", "cybersecurity", "privacy", "privacidad"],
+    "Internet de las cosas (IoT)": ["internet of things", "iot"],
+    "Computación cuántica": ["computacion cuantica", "quantum computing"],
+    "Diseño y construcción virtual": ["construccion virtual", "virtual construction", "bim"],
+    "Interacción humano-computadora": ["human computer interaction", "interaccion humano computadora", "hci"],
+    "Realidad virtual y aumentada": ["virtual reality", "augmented reality", "realidad virtual", "realidad aumentada"],
+    "Diseño de interfaces adaptativas": ["adaptive interfaces", "interfaces adaptativas"],
+    "Energías renovables": ["energias renovables", "renewable energy"],
+    "Economía circular": ["economia circular", "circular economy"],
+    "Gestión sostenible de recursos": ["gestion sostenible de recursos", "sustainable resource management"],
+    "Adaptación al cambio climático": ["adaptacion al cambio climatico", "climate adaptation"],
+    "Urbanismo sostenible": ["urbanismo sostenible", "sustainable urbanism"],
+    "Movilidad urbana": ["movilidad urbana", "urban mobility"],
+    "Infraestructura sostenible": ["infraestructura sostenible", "sustainable infrastructure"],
+    "Gestión inteligente de recursos": ["smart resource management", "gestion inteligente de recursos"],
+    "Tecnologías limpias": ["tecnologias limpias", "clean technologies"],
+    "Biodiversidad y conservación": ["biodiversidad", "conservacion", "biodiversity", "conservation"],
+    "Gestión de residuos": ["gestion de residuos", "waste management"],
+    "Materiales avanzados": ["materiales avanzados", "advanced materials"],
+    "Salud mental y bienestar": ["salud mental", "mental health", "wellbeing", "bienestar"],
+    "Educación, desarrollo cognitivo y socioafectivo": ["educacion", "education", "desarrollo cognitivo", "socioafectivo"],
+    "Comportamiento social": ["comportamiento social", "social behavior"],
+    "Mujer, cultura y sociedad": ["mujer", "woman", "women", "culture and society", "cultura y sociedad"],
+    "Pobreza e informalidad": ["pobreza", "poverty", "informalidad", "informality"],
+    "Medios digitales y sociedad": ["medios digitales", "digital media", "society"],
+    "Comunicación intercultural": ["comunicacion intercultural", "intercultural communication"],
+    "Narrativas transmedia": ["narrativas transmedia", "transmedia narratives"],
+    "Comportamiento digital": ["comportamiento digital", "digital behavior"],
+    "Ética y gobernanza": ["etica", "ethics", "governance", "gobernanza"],
+    "Responsabilidad social": ["responsabilidad social", "social responsibility"],
+    "Derechos humanos y tecnología": ["derechos humanos", "human rights", "technology"],
+    "Modelos de negocio digitales": ["modelos de negocio digitales", "digital business models"],
+    "Emprendimiento tecnológico": ["emprendimiento tecnologico", "technology entrepreneurship"],
+    "Gestión de la innovación": ["gestion de la innovacion", "innovation management"],
+    "Transformación organizacional": ["transformacion organizacional", "organizational transformation"],
+    "Fintech y servicios financieros": ["fintech", "financial services", "servicios financieros"],
+    "Mercados globales": ["mercados globales", "global markets"],
+    "Análisis de datos económicos": ["analisis de datos economicos", "economic data analysis"],
+    "Economía de plataformas": ["economia de plataformas", "platform economy"],
+    "Gestión del capital intelectual": ["capital intelectual", "intellectual capital"],
+    "Aprendizaje organizacional": ["aprendizaje organizacional", "organizational learning"],
+    "Transferencia de conocimiento": ["transferencia de conocimiento", "knowledge transfer"],
+    "Inteligencia de negocios": ["inteligencia de negocios", "business intelligence"],
 }
 
 
@@ -955,19 +782,16 @@ def build_classification_score(corpus: str, aliases: list[str]) -> int:
     return score
 
 
-def classify_career_dimensions(
+def classify_career_dimensions_by_hints(
     carrera: str | None,
     title_value: str | None,
     abstract_value: str | None,
     author_keywords_value: str | None,
     index_keywords_value: str | None,
-    source_title_value: str | None
+    source_title_value: str | None,
 ) -> dict:
     if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
-        return {
-            "area_carrera_raw": None,
-            "linea_carrera_raw": None,
-        }
+        return {"area_carrera_raw": None, "linea_carrera_raw": None}
 
     corpus = build_text_corpus(
         title_value,
@@ -976,36 +800,28 @@ def classify_career_dimensions(
         index_keywords_value,
         source_title_value,
     )
-
     if not corpus:
-        return {
-            "area_carrera_raw": None,
-            "linea_carrera_raw": None,
-        }
+        return {"area_carrera_raw": None, "linea_carrera_raw": None}
 
     line_scores: dict[str, int] = {}
     for area_name, lineas in CAREER_AREA_LINE_CATALOG[carrera].items():
         for linea in lineas:
-            aliases = [linea]
+            aliases = [linea, area_name]
             aliases.extend(CAREER_LINE_HINTS.get(carrera, {}).get(linea, []))
-            aliases.append(area_name)
             line_scores[linea] = build_classification_score(corpus, aliases)
 
     best_linea = choose_best_scored_candidate(line_scores, min_score=1)
     best_area = coerce_area_carrera_from_linea(carrera, best_linea) if best_linea else None
 
-    return {
-        "area_carrera_raw": best_area,
-        "linea_carrera_raw": best_linea,
-    }
+    return {"area_carrera_raw": best_area, "linea_carrera_raw": best_linea}
 
 
-def classify_idic_dimensions(
+def classify_idic_dimensions_by_hints(
     title_value: str | None,
     abstract_value: str | None,
     author_keywords_value: str | None,
     index_keywords_value: str | None,
-    source_title_value: str | None
+    source_title_value: str | None,
 ) -> dict:
     corpus = build_text_corpus(
         title_value,
@@ -1014,7 +830,6 @@ def classify_idic_dimensions(
         index_keywords_value,
         source_title_value,
     )
-
     if not corpus:
         return {
             "category_tematica_raw": None,
@@ -1044,6 +859,276 @@ def classify_idic_dimensions(
         "category_tematica_raw": best_category,
         "area_idic_raw": best_area,
         "linea_idic_raw": best_linea,
+    }
+
+
+# =========================
+# AZURE OPENAI THEMATIC CLASSIFIER
+# =========================
+_AZURE_OPENAI_CLIENT = None
+
+
+def is_thematic_llm_configured() -> bool:
+    return bool(
+        os.environ.get("AZURE_OPENAI_API_KEY")
+        and (os.environ.get("AZURE_OPENAI_BASE_URL") or os.environ.get("AZURE_OPENAI_ENDPOINT"))
+        and os.environ.get("AZURE_OPENAI_RESPONSES_MODEL")
+    )
+
+
+def get_azure_openai_base_url() -> str:
+    explicit_base_url = os.environ.get("AZURE_OPENAI_BASE_URL")
+    if explicit_base_url:
+        return explicit_base_url.rstrip("/")
+
+    endpoint = get_env("AZURE_OPENAI_ENDPOINT").rstrip("/")
+    return f"{endpoint}/openai/v1"
+
+
+def get_azure_openai_client():
+    global _AZURE_OPENAI_CLIENT
+
+    if _AZURE_OPENAI_CLIENT is None:
+        from openai import OpenAI
+
+        _AZURE_OPENAI_CLIENT = OpenAI(
+            api_key=get_env("AZURE_OPENAI_API_KEY"),
+            base_url=get_azure_openai_base_url(),
+        )
+
+    return _AZURE_OPENAI_CLIENT
+
+
+def get_thematic_llm_min_confidence() -> float:
+    raw = os.environ.get("THEMATIC_LLM_MIN_CONFIDENCE", "0.80")
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.80
+
+    if value < 0:
+        return 0.0
+    if value > 1:
+        return 1.0
+    return value
+
+
+def build_thematic_classification_prompt(
+    carrera: str,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> str:
+    career_catalog = CAREER_AREA_LINE_CATALOG.get(carrera, {})
+
+    payload = {
+        "carrera": carrera,
+        "career_catalog": career_catalog,
+        "idic_catalog": IDIC_CATEGORY_AREA_LINE_CATALOG,
+        "article": {
+            "title": clip_text(title_value, 2000),
+            "abstract_scopus": clip_text(abstract_value, 9000),
+            "author_keywords": clip_text(author_keywords_value, 2000),
+            "index_keywords": clip_text(index_keywords_value, 2000),
+            "source_title": clip_text(source_title_value, 1000),
+        },
+        "output_schema": {
+            "area_carrera_raw": "string|null",
+            "linea_carrera_raw": "string|null",
+            "category_tematica_raw": "string|null",
+            "area_idic_raw": "string|null",
+            "linea_idic_raw": "string|null",
+            "confidence": "number 0..1",
+            "justification": "short string",
+        },
+        "rules": [
+            "Usa principalmente title y abstract_scopus. Usa keywords y source_title solo como apoyo.",
+            "Debes elegir solo valores existentes en los catálogos proporcionados.",
+            "No inventes áreas, líneas o categorías.",
+            "Si no hay evidencia suficiente, devuelve null en los campos inciertos.",
+            "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
+            "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
+            "Devuelve únicamente JSON válido, sin markdown ni comentarios.",
+        ],
+    }
+
+    return (
+        "Eres un clasificador temático estricto para publicaciones académicas de ingeniería. "
+        "Analiza el artículo y clasifica usando únicamente el catálogo cerrado proporcionado.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def validate_llm_thematic_output(carrera: str | None, raw_output: dict | None) -> dict:
+    result = {
+        "area_carrera_raw": None,
+        "linea_carrera_raw": None,
+        "category_tematica_raw": None,
+        "area_idic_raw": None,
+        "linea_idic_raw": None,
+        "confidence": None,
+        "justification": None,
+    }
+
+    if not carrera or carrera not in CAREER_AREA_LINE_CATALOG or not raw_output:
+        return result
+
+    confidence = parse_float_or_none(raw_output.get("confidence"))
+    result["confidence"] = confidence
+    result["justification"] = raw_output.get("justification")
+
+    area_carrera = coerce_choice(raw_output.get("area_carrera_raw"), get_allowed_career_areas(carrera))
+    linea_carrera = coerce_choice(raw_output.get("linea_carrera_raw"), get_allowed_career_lines(carrera))
+
+    if linea_carrera and not area_carrera:
+        area_carrera = coerce_area_carrera_from_linea(carrera, linea_carrera)
+
+    if not is_valid_career_area_line(carrera, area_carrera, linea_carrera):
+        area_carrera = None
+        linea_carrera = None
+
+    category_tematica = coerce_choice(raw_output.get("category_tematica_raw"), get_allowed_idic_categories())
+    area_idic = coerce_choice(raw_output.get("area_idic_raw"), get_allowed_idic_areas(category_tematica))
+
+    if not area_idic:
+        area_idic = coerce_choice(raw_output.get("area_idic_raw"), get_allowed_idic_areas())
+
+    linea_idic = coerce_choice(raw_output.get("linea_idic_raw"), get_allowed_idic_lines(category_tematica, area_idic))
+
+    if not linea_idic:
+        linea_idic = coerce_choice(raw_output.get("linea_idic_raw"), get_allowed_idic_lines())
+
+    if linea_idic and not area_idic:
+        area_idic = coerce_area_idic_from_linea(linea_idic)
+
+    if area_idic and not category_tematica:
+        category_tematica = coerce_category_tematica_from_area(area_idic)
+
+    if not is_valid_idic_triplet(category_tematica, area_idic, linea_idic):
+        category_tematica = None
+        area_idic = None
+        linea_idic = None
+
+    min_confidence = get_thematic_llm_min_confidence()
+    if confidence is not None and confidence < min_confidence:
+        return result
+
+    result["area_carrera_raw"] = area_carrera
+    result["linea_carrera_raw"] = linea_carrera
+    result["category_tematica_raw"] = category_tematica
+    result["area_idic_raw"] = area_idic
+    result["linea_idic_raw"] = linea_idic
+    return result
+
+
+def classify_thematic_fields_with_llm(
+    carrera: str | None,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> dict:
+    empty_result = {
+        "area_carrera_raw": None,
+        "linea_carrera_raw": None,
+        "category_tematica_raw": None,
+        "area_idic_raw": None,
+        "linea_idic_raw": None,
+        "confidence": None,
+        "justification": None,
+    }
+
+    if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
+        return empty_result
+
+    if not is_thematic_llm_configured():
+        return empty_result
+
+    prompt = build_thematic_classification_prompt(
+        carrera=carrera,
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+    )
+
+    try:
+        client = get_azure_openai_client()
+        response = client.responses.create(
+            model=get_env("AZURE_OPENAI_RESPONSES_MODEL"),
+            input=prompt,
+        )
+
+        raw_output = extract_json_object(getattr(response, "output_text", None))
+        if not raw_output:
+            logging.warning("Thematic LLM returned non-JSON output.")
+            return empty_result
+
+        return validate_llm_thematic_output(carrera, raw_output)
+
+    except Exception as exc:
+        logging.warning("Thematic LLM classification failed: %s", str(exc))
+        return empty_result
+
+
+def classify_thematic_fields(
+    carrera: str | None,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> dict:
+    llm_result = classify_thematic_fields_with_llm(
+        carrera=carrera,
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+    )
+
+    has_any_llm_value = any(
+        [
+            llm_result.get("area_carrera_raw"),
+            llm_result.get("linea_carrera_raw"),
+            llm_result.get("category_tematica_raw"),
+            llm_result.get("area_idic_raw"),
+            llm_result.get("linea_idic_raw"),
+        ]
+    )
+
+    if has_any_llm_value:
+        return llm_result
+
+    career_hint_result = classify_career_dimensions_by_hints(
+        carrera=carrera,
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+    )
+    idic_hint_result = classify_idic_dimensions_by_hints(
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+    )
+
+    return {
+        "area_carrera_raw": career_hint_result.get("area_carrera_raw"),
+        "linea_carrera_raw": career_hint_result.get("linea_carrera_raw"),
+        "category_tematica_raw": idic_hint_result.get("category_tematica_raw"),
+        "area_idic_raw": idic_hint_result.get("area_idic_raw"),
+        "linea_idic_raw": idic_hint_result.get("linea_idic_raw"),
+        "confidence": None,
+        "justification": None,
     }
 
 
@@ -1123,7 +1208,7 @@ def create_pipeline_run(
     trigger_type: str,
     source_name: str,
     source_file_name: str,
-    source_file_path: str
+    source_file_path: str,
 ) -> int:
     from mssql_python import connect
 
@@ -1158,8 +1243,8 @@ def create_pipeline_run(
                 0,
                 0,
                 0,
-                0
-            )
+                0,
+            ),
         )
         conn.commit()
 
@@ -1180,7 +1265,7 @@ def update_pipeline_run(
     records_inserted: int = 0,
     records_updated: int = 0,
     records_rejected: int = 0,
-    error_message: str | None = None
+    error_message: str | None = None,
 ) -> None:
     from mssql_python import connect
 
@@ -1208,8 +1293,8 @@ def update_pipeline_run(
                 records_updated,
                 records_rejected,
                 error_message,
-                run_id
-            )
+                run_id,
+            ),
         )
         conn.commit()
         cursor.close()
@@ -1220,7 +1305,7 @@ def insert_pipeline_run_smoke(trigger_type: str, status: str, source_name: str =
         trigger_type=trigger_type,
         source_name=source_name,
         source_file_name="N/A",
-        source_file_path="N/A"
+        source_file_path="N/A",
     )
 
 
@@ -1311,7 +1396,7 @@ def find_docentes_header_indices(worksheet) -> tuple[int, int | None, int]:
             worksheet.iter_rows(
                 min_row=row_idx,
                 max_row=row_idx,
-                values_only=True
+                values_only=True,
             )
         )[0]
 
@@ -1361,7 +1446,7 @@ def extract_docentes_from_workbook_bytes(
                 ws.iter_rows(
                     min_row=excel_row_idx,
                     max_row=excel_row_idx,
-                    values_only=True
+                    values_only=True,
                 )
             )[0]
 
@@ -1435,7 +1520,7 @@ def insert_docentes_raw_rows(run_id: int, rows: list[dict]) -> int:
                     row["codigo_docente_raw"],
                     row["docente_principal_raw"],
                     row["docente_principal_normalizado"],
-                )
+                ),
             )
 
         conn.commit()
@@ -1482,7 +1567,7 @@ def rebuild_docentes_reference(run_id: int, rows: list[dict], periodo_academico:
 
         cursor.execute(
             "DELETE FROM ref.docentes_ulima WHERE periodo_academico = ?",
-            (periodo_academico,)
+            (periodo_academico,),
         )
 
         for row in deduped_rows:
@@ -1515,7 +1600,7 @@ def rebuild_docentes_reference(run_id: int, rows: list[dict], periodo_academico:
                     row["iniciales"],
                     row["activo"],
                     row["source_run_id"],
-                )
+                ),
             )
 
         conn.commit()
@@ -1621,7 +1706,7 @@ def get_docentes_reference(periodo_academico: str) -> list[dict]:
             WHERE periodo_academico = ?
               AND activo = 1
             """,
-            (periodo_academico,)
+            (periodo_academico,),
         )
 
         rows = cursor.fetchall()
@@ -1647,7 +1732,7 @@ def get_docentes_reference(periodo_academico: str) -> list[dict]:
 
 def split_authors_with_affiliations_blocks(
     author_full_names_value: str | None,
-    authors_with_affiliations_value: str | None
+    authors_with_affiliations_value: str | None,
 ) -> list[str]:
     text = str(authors_with_affiliations_value or "").strip()
     if not text:
@@ -1696,7 +1781,7 @@ def get_preferred_author_name_for_block(
     idx: int,
     full_authors: list[str],
     short_authors: list[str],
-    block: str | None
+    block: str | None,
 ) -> str | None:
     if idx < len(full_authors) and full_authors[idx]:
         return clean_author_full_name(full_authors[idx])
@@ -1728,7 +1813,7 @@ def parse_scopus_author_name(scopus_author_name: str) -> dict:
             idx -= 1
 
         if trailing_initials and idx >= 0:
-            family_tokens = normalized_tokens[:idx + 1]
+            family_tokens = normalized_tokens[: idx + 1]
             given_tokens = trailing_initials
         elif len(normalized_tokens) >= 2:
             family_tokens = normalized_tokens[:-1]
@@ -1816,7 +1901,7 @@ def unique_alias_match(
     scopus_aliases: set[str],
     docentes_ref: list[dict],
     alias_key: str,
-    career_hint: str | None = None
+    career_hint: str | None = None,
 ) -> dict:
     candidates = []
     for docente in docentes_ref:
@@ -1826,38 +1911,23 @@ def unique_alias_match(
     candidates = filter_candidates_by_career_hint(candidates, career_hint)
 
     if len(candidates) == 1:
-        return {
-            "matched": True,
-            "ambiguous": False,
-            "docente": candidates[0],
-        }
+        return {"matched": True, "ambiguous": False, "docente": candidates[0]}
 
     if len(candidates) > 1:
-        return {
-            "matched": False,
-            "ambiguous": True,
-            "docente": None,
-        }
+        return {"matched": False, "ambiguous": True, "docente": None}
 
-    return {
-        "matched": False,
-        "ambiguous": False,
-        "docente": None,
-    }
+    return {"matched": False, "ambiguous": False, "docente": None}
 
 
 def match_scopus_author_to_docente(
     scopus_author_name: str,
     docentes_ref: list[dict],
-    career_hint: str | None = None
+    career_hint: str | None = None,
 ) -> dict:
     parsed = parse_scopus_author_name(scopus_author_name)
     scopus_aliases = build_scopus_author_aliases(parsed)
 
-    exact_matches = [
-        d for d in docentes_ref
-        if d["nombre_normalizado"] == parsed["normalized_full"]
-    ]
+    exact_matches = [d for d in docentes_ref if d["nombre_normalizado"] == parsed["normalized_full"]]
     exact_matches = filter_candidates_by_career_hint(exact_matches, career_hint)
 
     if len(exact_matches) == 1:
@@ -1914,7 +1984,7 @@ def match_scopus_author_to_docente(
         scopus_aliases=scopus_aliases["strong_aliases"],
         docentes_ref=docentes_ref,
         alias_key="strong_aliases",
-        career_hint=career_hint
+        career_hint=career_hint,
     )
 
     if strong_match["matched"]:
@@ -1952,7 +2022,7 @@ def get_publication_level_engineering_careers(affiliations_value: str | None) ->
 
 def get_block_engineering_careers(
     block_value: str | None,
-    publication_level_careers: list[str]
+    publication_level_careers: list[str],
 ) -> list[str]:
     if not is_ulima_text(block_value):
         return []
@@ -2024,7 +2094,7 @@ def enrich_ulima_fields_from_ref(
         match_result = match_scopus_author_to_docente(
             scopus_author_name=scopus_author_name,
             docentes_ref=docentes_ref,
-            career_hint=resolved_career_hint
+            career_hint=resolved_career_hint,
         )
 
         if match_result["matched"]:
@@ -2180,12 +2250,16 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
     elif mapped.get("eid") and not mapped.get("metodo_cruce_scopus_raw"):
         mapped["metodo_cruce_scopus_raw"] = "EID"
 
-    # =========================
-    # NEW: THEMATIC CLASSIFICATION
-    # =========================
-    if not mapped.get("area_carrera_raw") or not mapped.get("linea_carrera_raw"):
-        career_classification = classify_career_dimensions(
-            carrera=mapped.get("carrera_raw"),
+    # -------------------------
+    # Thematic classification
+    # -------------------------
+    carrera_for_classification = mapped.get("carrera_raw")
+    if carrera_for_classification and ";" in str(carrera_for_classification):
+        carrera_for_classification = str(carrera_for_classification).split(";", 1)[0].strip()
+
+    if carrera_for_classification:
+        thematic = classify_thematic_fields(
+            carrera=carrera_for_classification,
             title_value=mapped.get("publication_title_raw"),
             abstract_value=mapped.get("abstract_scopus_raw"),
             author_keywords_value=mapped.get("author_keywords_raw"),
@@ -2193,35 +2267,25 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
             source_title_value=mapped.get("source_title_raw"),
         )
 
-        if not mapped.get("area_carrera_raw") and career_classification.get("area_carrera_raw"):
-            mapped["area_carrera_raw"] = career_classification["area_carrera_raw"]
+        if not mapped.get("area_carrera_raw") and thematic.get("area_carrera_raw"):
+            mapped["area_carrera_raw"] = thematic["area_carrera_raw"]
 
-        if not mapped.get("linea_carrera_raw") and career_classification.get("linea_carrera_raw"):
-            mapped["linea_carrera_raw"] = career_classification["linea_carrera_raw"]
+        if not mapped.get("linea_carrera_raw") and thematic.get("linea_carrera_raw"):
+            mapped["linea_carrera_raw"] = thematic["linea_carrera_raw"]
 
-    if not mapped.get("category_tematica_raw") or not mapped.get("area_idic_raw") or not mapped.get("linea_idic_raw"):
-        idic_classification = classify_idic_dimensions(
-            title_value=mapped.get("publication_title_raw"),
-            abstract_value=mapped.get("abstract_scopus_raw"),
-            author_keywords_value=mapped.get("author_keywords_raw"),
-            index_keywords_value=mapped.get("index_keywords_raw"),
-            source_title_value=mapped.get("source_title_raw"),
-        )
+        if not mapped.get("category_tematica_raw") and thematic.get("category_tematica_raw"):
+            mapped["category_tematica_raw"] = thematic["category_tematica_raw"]
 
-        if not mapped.get("category_tematica_raw") and idic_classification.get("category_tematica_raw"):
-            mapped["category_tematica_raw"] = idic_classification["category_tematica_raw"]
+        if not mapped.get("area_idic_raw") and thematic.get("area_idic_raw"):
+            mapped["area_idic_raw"] = thematic["area_idic_raw"]
 
-        if not mapped.get("area_idic_raw") and idic_classification.get("area_idic_raw"):
-            mapped["area_idic_raw"] = idic_classification["area_idic_raw"]
+        if not mapped.get("linea_idic_raw") and thematic.get("linea_idic_raw"):
+            mapped["linea_idic_raw"] = thematic["linea_idic_raw"]
 
-        if not mapped.get("linea_idic_raw") and idic_classification.get("linea_idic_raw"):
-            mapped["linea_idic_raw"] = idic_classification["linea_idic_raw"]
-
-    # validación final de combinaciones
     if not is_valid_career_area_line(
-        mapped.get("carrera_raw"),
+        carrera_for_classification,
         mapped.get("area_carrera_raw"),
-        mapped.get("linea_carrera_raw")
+        mapped.get("linea_carrera_raw"),
     ):
         mapped["area_carrera_raw"] = None
         mapped["linea_carrera_raw"] = None
@@ -2229,7 +2293,7 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
     if not is_valid_idic_triplet(
         mapped.get("category_tematica_raw"),
         mapped.get("area_idic_raw"),
-        mapped.get("linea_idic_raw")
+        mapped.get("linea_idic_raw"),
     ):
         mapped["category_tematica_raw"] = None
         mapped["area_idic_raw"] = None
@@ -2265,7 +2329,12 @@ def parse_csv_text(csv_text: str) -> list[dict]:
     return list(reader)
 
 
-def insert_rows_to_staging(run_id: int, source_file_name: str, rows: list[dict], docentes_ref: list[dict]) -> tuple[int, int]:
+def insert_rows_to_staging(
+    run_id: int,
+    source_file_name: str,
+    rows: list[dict],
+    docentes_ref: list[dict],
+) -> tuple[int, int]:
     from mssql_python import connect
 
     sql_conn_str = get_sql_connection_string()
@@ -2373,7 +2442,7 @@ def insert_rows_to_staging(run_id: int, source_file_name: str, rows: list[dict],
                     mapped.get("record_hash"),
                     mapped.get("is_valid_for_curated"),
                     mapped.get("rejection_reason"),
-                )
+                ),
             )
 
             if mapped.get("is_valid_for_curated") == 1:
@@ -2403,6 +2472,7 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "sql_database": get_env("SQL_DATABASE"),
             "storage_account": get_env("DATA_STORAGE_ACCOUNT"),
             "containers": container_status,
+            "thematic_llm_configured": is_thematic_llm_configured(),
         }
 
         return func.HttpResponse(
@@ -2470,7 +2540,7 @@ def run_ingest_docentes(req: func.HttpRequest) -> func.HttpResponse:
             trigger_type="MANUAL",
             source_name="DOCENTES_ULIMA",
             source_file_name=blob_name,
-            source_file_path=f"{docentes_container}/{blob_name}"
+            source_file_path=f"{docentes_container}/{blob_name}",
         )
 
         workbook_bytes = download_blob_bytes(docentes_container, blob_name)
@@ -2488,9 +2558,7 @@ def run_ingest_docentes(req: func.HttpRequest) -> func.HttpResponse:
             periodo_academico=periodo_academico,
         )
 
-        processed_name = (
-            f"docentes/{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{os.path.basename(blob_name)}"
-        )
+        processed_name = f"docentes/{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{os.path.basename(blob_name)}"
         upload_bytes_blob(processed_container, processed_name, workbook_bytes)
 
         log_payload = {
@@ -2514,7 +2582,7 @@ def run_ingest_docentes(req: func.HttpRequest) -> func.HttpResponse:
             records_inserted=docentes_unique_loaded,
             records_updated=0,
             records_rejected=0,
-            error_message=None
+            error_message=None,
         )
 
         return func.HttpResponse(
@@ -2544,7 +2612,7 @@ def run_ingest_docentes(req: func.HttpRequest) -> func.HttpResponse:
             update_pipeline_run(
                 run_id=run_id,
                 status="FAILED",
-                error_message=str(exc)
+                error_message=str(exc),
             )
 
         return func.HttpResponse(
@@ -2580,7 +2648,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             trigger_type="MANUAL",
             source_name="SCOPUS",
             source_file_name=blob_name,
-            source_file_path=f"{raw_container}/{blob_name}"
+            source_file_path=f"{raw_container}/{blob_name}",
         )
 
         csv_text = download_blob_text(raw_container, blob_name)
@@ -2591,7 +2659,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             run_id=run_id,
             source_file_name=blob_name,
             rows=rows,
-            docentes_ref=docentes_ref
+            docentes_ref=docentes_ref,
         )
 
         execute_upsert_from_staging(run_id)
@@ -2621,7 +2689,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             records_inserted=records_inserted,
             records_updated=0,
             records_rejected=records_rejected,
-            error_message=None
+            error_message=None,
         )
 
         return func.HttpResponse(
@@ -2652,7 +2720,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             update_pipeline_run(
                 run_id=run_id,
                 status="FAILED",
-                error_message=str(exc)
+                error_message=str(exc),
             )
 
         return func.HttpResponse(

@@ -95,6 +95,75 @@ def row_attr(row, attr: str, idx: int):
         return row[idx]
 
 
+def normalize_url_or_doi(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    if raw.lower().startswith("http://") or raw.lower().startswith("https://"):
+        return raw
+
+    if raw.lower().startswith("doi:"):
+        raw = raw[4:].strip()
+
+    return raw
+
+
+def build_doi_url(doi_value: str | None) -> str | None:
+    normalized = normalize_url_or_doi(doi_value)
+    if not normalized:
+        return None
+
+    if normalized.lower().startswith("http://") or normalized.lower().startswith("https://"):
+        return normalized
+
+    return f"https://doi.org/{normalized}"
+
+
+def is_conference_document_type(document_type_value: str | None) -> bool:
+    norm = normalize_generic_text(document_type_value)
+    return "conference" in norm
+
+
+def derive_conference_journal_value(document_type_value: str | None) -> str | None:
+    if not document_type_value:
+        return None
+    return "Conference" if is_conference_document_type(document_type_value) else "Journal"
+
+
+def derive_revista_and_conference(
+    source_title_value: str | None,
+    document_type_value: str | None
+) -> tuple[str | None, str | None]:
+    if not source_title_value:
+        return None, None
+
+    if is_conference_document_type(document_type_value):
+        return None, source_title_value
+
+    return source_title_value, None
+
+
+def build_authors_display(
+    author_full_names_value: str | None,
+    authors_value: str | None
+) -> str | None:
+    full_names = [clean_author_full_name(x) for x in split_semicolon_values(author_full_names_value)]
+    full_names = [x for x in full_names if x]
+    if full_names:
+        return "; ".join(full_names)
+
+    short_names = [clean_author_full_name(x) for x in split_semicolon_values(authors_value)]
+    short_names = [x for x in short_names if x]
+    if short_names:
+        return "; ".join(short_names)
+
+    return None
+
+
 # =========================
 # CAREER HINTS FROM TEXT
 # =========================
@@ -1189,6 +1258,8 @@ COLUMN_ALIASES = {
     "linea_carrera_raw": ["Linea de la carrera"],
     "carrera_raw": ["Carrera"],
     "es_scopus_raw": ["es_scopus"],
+    "retractado_raw": ["Retractado"],
+    "descontinuado_scopus_raw": ["Descontinuado de SCOPUS", "Descontinuado de Scopus"],
     "metodo_cruce_scopus_raw": ["Método de cruce Scopus", "Metodo de cruce Scopus"],
     "abstract_scopus_raw": ["Abstract Scopus", "Abstract"],
     "author_keywords_raw": ["Author keywords", "Author Keywords"],
@@ -1209,6 +1280,11 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
     author_full_names_value = safe_get(row, ["Author full names"])
     authors_with_affiliations_value = safe_get(row, ["Authors with affiliations"])
     affiliations_value = safe_get(row, ["Affiliations", "Afiliaciones"])
+    source_title_value = safe_get(row, ["Source title", "Source Title"])
+    document_type_value = safe_get(row, ["Document Type", "Document Type (Scopus)", "Source & document type"])
+    publication_stage_value = safe_get(row, ["Publication Stage", "Publication Status"])
+    publisher_value = safe_get(row, ["Publisher"])
+    doi_value = safe_get(row, ["DOI /link", "DOI"])
 
     enrichment = enrich_ulima_fields_from_ref(
         authors_value=authors_value,
@@ -1218,7 +1294,12 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
         docentes_ref=docentes_ref,
     )
 
-    mapped["authors_raw"] = authors_value or mapped.get("authors_raw")
+    authors_display = build_authors_display(author_full_names_value, authors_value)
+    conference_journal_value = derive_conference_journal_value(document_type_value)
+    revista_value, conference_value = derive_revista_and_conference(source_title_value, document_type_value)
+    alternative_link_value = build_doi_url(doi_value)
+
+    mapped["authors_raw"] = authors_display or mapped.get("authors_raw")
     mapped["affiliation_raw"] = authors_with_affiliations_value or affiliations_value or mapped.get("affiliation_raw")
     mapped["ulima_docentes_raw"] = enrichment["ulima_docentes_raw"]
     mapped["first_author_ulima_raw"] = enrichment["first_author_ulima_raw"]
@@ -1226,11 +1307,44 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
     if enrichment["carrera_raw"]:
         mapped["carrera_raw"] = enrichment["carrera_raw"]
 
+    if not mapped.get("conference_journal_raw"):
+        mapped["conference_journal_raw"] = conference_journal_value
+
+    if not mapped.get("revista_raw"):
+        mapped["revista_raw"] = revista_value
+
+    if not mapped.get("conference_raw"):
+        mapped["conference_raw"] = conference_value
+
+    if not mapped.get("editorial_publication_raw"):
+        mapped["editorial_publication_raw"] = publisher_value
+
+    if not mapped.get("publication_status_raw"):
+        mapped["publication_status_raw"] = publication_stage_value
+
+    if not mapped.get("source_title_raw"):
+        mapped["source_title_raw"] = source_title_value
+
+    if not mapped.get("document_type_scopus_raw"):
+        mapped["document_type_scopus_raw"] = document_type_value
+
+    if not mapped.get("doi_link_raw"):
+        mapped["doi_link_raw"] = normalize_url_or_doi(doi_value)
+
+    if not mapped.get("alternative_link_raw"):
+        mapped["alternative_link_raw"] = alternative_link_value
+
     if not mapped.get("indexation_raw"):
         mapped["indexation_raw"] = "Scopus"
 
     if not mapped.get("es_scopus_raw"):
         mapped["es_scopus_raw"] = "True"
+
+    if not mapped.get("retractado_raw"):
+        mapped["retractado_raw"] = "No"
+
+    if not mapped.get("descontinuado_scopus_raw"):
+        mapped["descontinuado_scopus_raw"] = "No"
 
     if enrichment["metodo_cruce_scopus_raw"]:
         mapped["metodo_cruce_scopus_raw"] = enrichment["metodo_cruce_scopus_raw"]
@@ -1315,6 +1429,8 @@ def insert_rows_to_staging(run_id: int, source_file_name: str, rows: list[dict],
                     linea_carrera_raw,
                     carrera_raw,
                     es_scopus_raw,
+                    retractado_raw,
+                    descontinuado_scopus_raw,
                     metodo_cruce_scopus_raw,
                     abstract_scopus_raw,
                     author_keywords_raw,
@@ -1326,7 +1442,7 @@ def insert_rows_to_staging(run_id: int, source_file_name: str, rows: list[dict],
                     is_valid_for_curated,
                     rejection_reason
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     run_id,
@@ -1361,6 +1477,8 @@ def insert_rows_to_staging(run_id: int, source_file_name: str, rows: list[dict],
                     mapped.get("linea_carrera_raw"),
                     mapped.get("carrera_raw"),
                     mapped.get("es_scopus_raw"),
+                    mapped.get("retractado_raw"),
+                    mapped.get("descontinuado_scopus_raw"),
                     mapped.get("metodo_cruce_scopus_raw"),
                     mapped.get("abstract_scopus_raw"),
                     mapped.get("author_keywords_raw"),

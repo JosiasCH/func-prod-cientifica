@@ -1244,7 +1244,7 @@ COLUMN_ALIASES = {
     "doi_link_raw": ["DOI /link", "DOI"],
     "publication_date_raw": ["Fecha de publicacion", "Publication date", "Date"],
     "publication_date_scopus_raw": ["Fecha de publicacion (Scopus)"],
-    "revista_raw": ["Revista", "Source title", "Source Title"],
+    "revista_raw": ["Revista"],
     "conference_raw": ["Conferencia", "Conference name"],
     "publication_status_raw": ["Estado publicación", "Publication Stage", "Publication Status"],
     "issn_raw": ["ISSN", "Serial identifiers (e.g. ISSN)"],
@@ -1310,11 +1310,8 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
     if not mapped.get("conference_journal_raw"):
         mapped["conference_journal_raw"] = conference_journal_value
 
-    if not mapped.get("revista_raw"):
-        mapped["revista_raw"] = revista_value
-
-    if not mapped.get("conference_raw"):
-        mapped["conference_raw"] = conference_value
+    mapped["revista_raw"] = revista_value
+    mapped["conference_raw"] = conference_value
 
     if not mapped.get("editorial_publication_raw"):
         mapped["editorial_publication_raw"] = publisher_value

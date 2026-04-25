@@ -265,6 +265,14 @@ def extract_json_object(text: str | None) -> dict | None:
         return None
 
 
+def merge_non_null_fields(base: dict, filler: dict, fields: list[str]) -> dict:
+    result = dict(base)
+    for field in fields:
+        if not result.get(field) and filler.get(field):
+            result[field] = filler[field]
+    return result
+
+
 # =========================
 # CAREER HINTS FROM TEXT
 # =========================
@@ -899,18 +907,38 @@ def get_azure_openai_client():
     return _AZURE_OPENAI_CLIENT
 
 
-def get_thematic_llm_min_confidence() -> float:
-    raw = os.environ.get("THEMATIC_LLM_MIN_CONFIDENCE", "0.80")
+def get_thematic_llm_min_confidence(mode: str = "strict") -> float:
+    env_name = "THEMATIC_LLM_MIN_CONFIDENCE"
+    default_value = "0.80"
+
+    if mode == "approx":
+        env_name = "THEMATIC_LLM_MIN_CONFIDENCE_APPROX"
+        default_value = "0.55"
+
+    raw = os.environ.get(env_name, default_value)
     try:
         value = float(raw)
     except Exception:
-        value = 0.80
+        value = float(default_value)
 
     if value < 0:
         return 0.0
     if value > 1:
         return 1.0
     return value
+
+
+def build_thematic_empty_result() -> dict:
+    return {
+        "area_carrera_raw": None,
+        "linea_carrera_raw": None,
+        "category_tematica_raw": None,
+        "area_idic_raw": None,
+        "linea_idic_raw": None,
+        "confidence": None,
+        "justification": None,
+        "classification_mode": None,
+    }
 
 
 def build_thematic_classification_prompt(
@@ -920,10 +948,43 @@ def build_thematic_classification_prompt(
     author_keywords_value: str | None,
     index_keywords_value: str | None,
     source_title_value: str | None,
+    mode: str = "strict",
 ) -> str:
     career_catalog = CAREER_AREA_LINE_CATALOG.get(carrera, {})
 
+    if mode == "approx":
+        classifier_role = (
+            "Eres un clasificador temático académico que debe elegir la opción más cercana y defendible "
+            "cuando no exista evidencia suficiente para una clasificación exacta."
+        )
+        rules = [
+            "Usa principalmente title y abstract_scopus. Usa keywords y source_title solo como apoyo.",
+            "Debes elegir solo valores existentes en los catálogos proporcionados.",
+            "No inventes áreas, líneas o categorías.",
+            "Primero intenta una clasificación exacta.",
+            "Si no hay evidencia suficiente para exactitud total, elige la opción más próxima semánticamente dentro del catálogo.",
+            "Prioriza no dejar campos vacíos cuando exista una aproximación razonable y defendible.",
+            "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
+            "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
+            "Si realmente no hay base razonable, devuelve null.",
+            "Devuelve únicamente JSON válido, sin markdown ni comentarios.",
+        ]
+    else:
+        classifier_role = (
+            "Eres un clasificador temático estricto para publicaciones académicas de ingeniería."
+        )
+        rules = [
+            "Usa principalmente title y abstract_scopus. Usa keywords y source_title solo como apoyo.",
+            "Debes elegir solo valores existentes en los catálogos proporcionados.",
+            "No inventes áreas, líneas o categorías.",
+            "Si no hay evidencia suficiente, devuelve null en los campos inciertos.",
+            "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
+            "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
+            "Devuelve únicamente JSON válido, sin markdown ni comentarios.",
+        ]
+
     payload = {
+        "mode": mode,
         "carrera": carrera,
         "career_catalog": career_catalog,
         "idic_catalog": IDIC_CATEGORY_AREA_LINE_CATALOG,
@@ -943,34 +1004,22 @@ def build_thematic_classification_prompt(
             "confidence": "number 0..1",
             "justification": "short string",
         },
-        "rules": [
-            "Usa principalmente title y abstract_scopus. Usa keywords y source_title solo como apoyo.",
-            "Debes elegir solo valores existentes en los catálogos proporcionados.",
-            "No inventes áreas, líneas o categorías.",
-            "Si no hay evidencia suficiente, devuelve null en los campos inciertos.",
-            "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
-            "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
-            "Devuelve únicamente JSON válido, sin markdown ni comentarios.",
-        ],
+        "rules": rules,
     }
 
     return (
-        "Eres un clasificador temático estricto para publicaciones académicas de ingeniería. "
+        f"{classifier_role} "
         "Analiza el artículo y clasifica usando únicamente el catálogo cerrado proporcionado.\n\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 
 
-def validate_llm_thematic_output(carrera: str | None, raw_output: dict | None) -> dict:
-    result = {
-        "area_carrera_raw": None,
-        "linea_carrera_raw": None,
-        "category_tematica_raw": None,
-        "area_idic_raw": None,
-        "linea_idic_raw": None,
-        "confidence": None,
-        "justification": None,
-    }
+def validate_llm_thematic_output(
+    carrera: str | None,
+    raw_output: dict | None,
+    mode: str = "strict",
+) -> dict:
+    result = build_thematic_empty_result()
 
     if not carrera or carrera not in CAREER_AREA_LINE_CATALOG or not raw_output:
         return result
@@ -978,6 +1027,7 @@ def validate_llm_thematic_output(carrera: str | None, raw_output: dict | None) -
     confidence = parse_float_or_none(raw_output.get("confidence"))
     result["confidence"] = confidence
     result["justification"] = raw_output.get("justification")
+    result["classification_mode"] = mode
 
     area_carrera = coerce_choice(raw_output.get("area_carrera_raw"), get_allowed_career_areas(carrera))
     linea_carrera = coerce_choice(raw_output.get("linea_carrera_raw"), get_allowed_career_lines(carrera))
@@ -1011,9 +1061,9 @@ def validate_llm_thematic_output(carrera: str | None, raw_output: dict | None) -
         area_idic = None
         linea_idic = None
 
-    min_confidence = get_thematic_llm_min_confidence()
+    min_confidence = get_thematic_llm_min_confidence(mode=mode)
     if confidence is not None and confidence < min_confidence:
-        return result
+        return build_thematic_empty_result()
 
     result["area_carrera_raw"] = area_carrera
     result["linea_carrera_raw"] = linea_carrera
@@ -1030,16 +1080,9 @@ def classify_thematic_fields_with_llm(
     author_keywords_value: str | None,
     index_keywords_value: str | None,
     source_title_value: str | None,
+    mode: str = "strict",
 ) -> dict:
-    empty_result = {
-        "area_carrera_raw": None,
-        "linea_carrera_raw": None,
-        "category_tematica_raw": None,
-        "area_idic_raw": None,
-        "linea_idic_raw": None,
-        "confidence": None,
-        "justification": None,
-    }
+    empty_result = build_thematic_empty_result()
 
     if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
         return empty_result
@@ -1054,6 +1097,7 @@ def classify_thematic_fields_with_llm(
         author_keywords_value=author_keywords_value,
         index_keywords_value=index_keywords_value,
         source_title_value=source_title_value,
+        mode=mode,
     )
 
     try:
@@ -1065,13 +1109,13 @@ def classify_thematic_fields_with_llm(
 
         raw_output = extract_json_object(getattr(response, "output_text", None))
         if not raw_output:
-            logging.warning("Thematic LLM returned non-JSON output.")
+            logging.warning("Thematic LLM (%s) returned non-JSON output.", mode)
             return empty_result
 
-        return validate_llm_thematic_output(carrera, raw_output)
+        return validate_llm_thematic_output(carrera, raw_output, mode=mode)
 
     except Exception as exc:
-        logging.warning("Thematic LLM classification failed: %s", str(exc))
+        logging.warning("Thematic LLM classification failed (%s): %s", mode, str(exc))
         return empty_result
 
 
@@ -1083,53 +1127,96 @@ def classify_thematic_fields(
     index_keywords_value: str | None,
     source_title_value: str | None,
 ) -> dict:
-    llm_result = classify_thematic_fields_with_llm(
+    fields_to_fill = [
+        "area_carrera_raw",
+        "linea_carrera_raw",
+        "category_tematica_raw",
+        "area_idic_raw",
+        "linea_idic_raw",
+    ]
+
+    strict_result = classify_thematic_fields_with_llm(
         carrera=carrera,
         title_value=title_value,
         abstract_value=abstract_value,
         author_keywords_value=author_keywords_value,
         index_keywords_value=index_keywords_value,
         source_title_value=source_title_value,
+        mode="strict",
     )
 
-    has_any_llm_value = any(
-        [
-            llm_result.get("area_carrera_raw"),
-            llm_result.get("linea_carrera_raw"),
-            llm_result.get("category_tematica_raw"),
-            llm_result.get("area_idic_raw"),
-            llm_result.get("linea_idic_raw"),
-        ]
-    )
+    merged = dict(strict_result)
 
-    if has_any_llm_value:
-        return llm_result
+    needs_approx = any(not merged.get(field) for field in fields_to_fill)
 
-    career_hint_result = classify_career_dimensions_by_hints(
-        carrera=carrera,
-        title_value=title_value,
-        abstract_value=abstract_value,
-        author_keywords_value=author_keywords_value,
-        index_keywords_value=index_keywords_value,
-        source_title_value=source_title_value,
-    )
-    idic_hint_result = classify_idic_dimensions_by_hints(
-        title_value=title_value,
-        abstract_value=abstract_value,
-        author_keywords_value=author_keywords_value,
-        index_keywords_value=index_keywords_value,
-        source_title_value=source_title_value,
-    )
+    if needs_approx:
+        approx_result = classify_thematic_fields_with_llm(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+            mode="approx",
+        )
+        merged = merge_non_null_fields(merged, approx_result, fields_to_fill)
 
-    return {
-        "area_carrera_raw": career_hint_result.get("area_carrera_raw"),
-        "linea_carrera_raw": career_hint_result.get("linea_carrera_raw"),
-        "category_tematica_raw": idic_hint_result.get("category_tematica_raw"),
-        "area_idic_raw": idic_hint_result.get("area_idic_raw"),
-        "linea_idic_raw": idic_hint_result.get("linea_idic_raw"),
-        "confidence": None,
-        "justification": None,
-    }
+        if not merged.get("confidence") and approx_result.get("confidence") is not None:
+            merged["confidence"] = approx_result.get("confidence")
+        if not merged.get("justification") and approx_result.get("justification"):
+            merged["justification"] = approx_result.get("justification")
+        if not merged.get("classification_mode") and approx_result.get("classification_mode"):
+            merged["classification_mode"] = approx_result.get("classification_mode")
+
+    needs_hints = any(not merged.get(field) for field in fields_to_fill)
+
+    if needs_hints:
+        career_hint_result = classify_career_dimensions_by_hints(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+        idic_hint_result = classify_idic_dimensions_by_hints(
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+
+        merged = merge_non_null_fields(
+            merged,
+            {
+                "area_carrera_raw": career_hint_result.get("area_carrera_raw"),
+                "linea_carrera_raw": career_hint_result.get("linea_carrera_raw"),
+                "category_tematica_raw": idic_hint_result.get("category_tematica_raw"),
+                "area_idic_raw": idic_hint_result.get("area_idic_raw"),
+                "linea_idic_raw": idic_hint_result.get("linea_idic_raw"),
+            },
+            fields_to_fill,
+        )
+
+    if not is_valid_career_area_line(
+        carrera,
+        merged.get("area_carrera_raw"),
+        merged.get("linea_carrera_raw"),
+    ):
+        merged["area_carrera_raw"] = None
+        merged["linea_carrera_raw"] = None
+
+    if not is_valid_idic_triplet(
+        merged.get("category_tematica_raw"),
+        merged.get("area_idic_raw"),
+        merged.get("linea_idic_raw"),
+    ):
+        merged["category_tematica_raw"] = None
+        merged["area_idic_raw"] = None
+        merged["linea_idic_raw"] = None
+
+    return merged
 
 
 # =========================

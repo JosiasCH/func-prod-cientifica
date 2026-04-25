@@ -1723,15 +1723,14 @@ def classify_thematic_fields(
     source_title_value: str | None,
 ) -> dict:
     merged = build_thematic_empty_result()
-    fields_to_fill = [
-        "area_carrera_raw",
-        "linea_carrera_raw",
-        "category_tematica_raw",
-        "area_idic_raw",
-        "linea_idic_raw",
-    ]
 
-    # 1) LLM strict
+    if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
+        return merged
+
+    career_fields = ["area_carrera_raw", "linea_carrera_raw"]
+    idic_fields = ["category_tematica_raw", "area_idic_raw", "linea_idic_raw"]
+
+    # 1) LLM strict para TODO
     strict_result = classify_thematic_fields_with_llm(
         carrera=carrera,
         title_value=title_value,
@@ -1741,7 +1740,13 @@ def classify_thematic_fields(
         source_title_value=source_title_value,
         mode="strict",
     )
-    merged = merge_non_null_fields(merged, strict_result, fields_to_fill)
+
+    merged = merge_non_null_fields(
+        merged,
+        strict_result,
+        career_fields + idic_fields,
+    )
+
     if strict_result.get("confidence") is not None:
         merged["confidence"] = strict_result.get("confidence")
     if strict_result.get("justification"):
@@ -1749,8 +1754,8 @@ def classify_thematic_fields(
     if strict_result.get("classification_mode"):
         merged["classification_mode"] = strict_result.get("classification_mode")
 
-    # 2) LLM approx only for missing fields
-    if missing_thematic_fields(merged):
+    # 2) LLM approx SOLO para carrera
+    if any(not merged.get(field) for field in career_fields):
         approx_result = classify_thematic_fields_with_llm(
             carrera=carrera,
             title_value=title_value,
@@ -1760,16 +1765,27 @@ def classify_thematic_fields(
             source_title_value=source_title_value,
             mode="approx",
         )
-        merged = merge_non_null_fields(merged, approx_result, fields_to_fill)
+
+        merged = merge_non_null_fields(
+            merged,
+            approx_result,
+            career_fields,
+        )
+
+        if (
+            any(approx_result.get(field) for field in career_fields)
+            and merged.get("classification_mode") != "strict"
+        ):
+            merged["classification_mode"] = approx_result.get("classification_mode") or "approx"
+
         if merged.get("confidence") is None and approx_result.get("confidence") is not None:
             merged["confidence"] = approx_result.get("confidence")
+
         if not merged.get("justification") and approx_result.get("justification"):
             merged["justification"] = approx_result.get("justification")
-        if not merged.get("classification_mode") and approx_result.get("classification_mode"):
-            merged["classification_mode"] = approx_result.get("classification_mode")
 
-    # 3) deterministic hints exact
-    if missing_thematic_fields(merged):
+    # 3) Hints strict para carrera
+    if any(not merged.get(field) for field in career_fields):
         career_hint_result = classify_career_dimensions_by_hints(
             carrera=carrera,
             title_value=title_value,
@@ -1778,6 +1794,44 @@ def classify_thematic_fields(
             index_keywords_value=index_keywords_value,
             source_title_value=source_title_value,
         )
+
+        merged = merge_non_null_fields(
+            merged,
+            career_hint_result,
+            career_fields,
+        )
+
+        if (
+            any(career_hint_result.get(field) for field in career_fields)
+            and not merged.get("classification_mode")
+        ):
+            merged["classification_mode"] = "career_hints_strict"
+
+    # 4) Hints approx SOLO para carrera
+    if any(not merged.get(field) for field in career_fields):
+        career_hint_approx_result = classify_career_dimensions_by_hints_approx(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+
+        merged = merge_non_null_fields(
+            merged,
+            career_hint_approx_result,
+            career_fields,
+        )
+
+        if (
+            any(career_hint_approx_result.get(field) for field in career_fields)
+            and not merged.get("classification_mode")
+        ):
+            merged["classification_mode"] = "career_hints_approx"
+
+    # 5) Hints strict para IDIC
+    if any(not merged.get(field) for field in idic_fields):
         idic_hint_result = classify_idic_dimensions_by_hints(
             title_value=title_value,
             abstract_value=abstract_value,
@@ -1788,52 +1842,17 @@ def classify_thematic_fields(
 
         merged = merge_non_null_fields(
             merged,
-            {
-                "area_carrera_raw": career_hint_result.get("area_carrera_raw"),
-                "linea_carrera_raw": career_hint_result.get("linea_carrera_raw"),
-                "category_tematica_raw": idic_hint_result.get("category_tematica_raw"),
-                "area_idic_raw": idic_hint_result.get("area_idic_raw"),
-                "linea_idic_raw": idic_hint_result.get("linea_idic_raw"),
-                "classification_mode": merged.get("classification_mode") or "hints_strict",
-            },
-            fields_to_fill,
-        )
-        if not merged.get("classification_mode") and has_any_thematic_field(merged):
-            merged["classification_mode"] = "hints_strict"
-
-    # 4) deterministic hints approx for remaining nulls
-    if missing_thematic_fields(merged):
-        career_hint_approx_result = classify_career_dimensions_by_hints_approx(
-            carrera=carrera,
-            title_value=title_value,
-            abstract_value=abstract_value,
-            author_keywords_value=author_keywords_value,
-            index_keywords_value=index_keywords_value,
-            source_title_value=source_title_value,
-        )
-        idic_hint_approx_result = classify_idic_dimensions_by_hints_approx(
-            title_value=title_value,
-            abstract_value=abstract_value,
-            author_keywords_value=author_keywords_value,
-            index_keywords_value=index_keywords_value,
-            source_title_value=source_title_value,
+            idic_hint_result,
+            idic_fields,
         )
 
-        merged = merge_non_null_fields(
-            merged,
-            {
-                "area_carrera_raw": career_hint_approx_result.get("area_carrera_raw"),
-                "linea_carrera_raw": career_hint_approx_result.get("linea_carrera_raw"),
-                "category_tematica_raw": idic_hint_approx_result.get("category_tematica_raw"),
-                "area_idic_raw": idic_hint_approx_result.get("area_idic_raw"),
-                "linea_idic_raw": idic_hint_approx_result.get("linea_idic_raw"),
-            },
-            fields_to_fill,
-        )
+        if (
+            any(idic_hint_result.get(field) for field in idic_fields)
+            and not merged.get("classification_mode")
+        ):
+            merged["classification_mode"] = "idic_hints_strict"
 
-        if not merged.get("classification_mode") and has_any_thematic_field(merged):
-            merged["classification_mode"] = "hints_approx"
-
+    # Validación final
     if not is_valid_career_area_line(
         carrera,
         merged.get("area_carrera_raw"),

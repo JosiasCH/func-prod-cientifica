@@ -313,6 +313,223 @@ def clip_text(value: str | None, max_chars: int = 7000) -> str | None:
         return value
     return value[:max_chars]
 
+CSV_DELIMITER_CANDIDATES = [",", ";", "\t", "|"]
+CSV_PARSE_PREVIEW_ROWS = 25
+
+SQL_SAFE_MAX_LENGTHS = {
+    "eid": 64,
+    "publication_year_raw": 16,
+    "scopus_year_raw": 16,
+    "conference_journal_raw": 32,
+    "indexation_raw": 64,
+    "issn_raw": 64,
+    "isbn_raw": 64,
+    "es_scopus_raw": 16,
+    "retractado_raw": 16,
+    "descontinuado_scopus_raw": 64,
+    "first_author_ulima_raw": 16,
+    "metodo_cruce_scopus_raw": 64,
+}
+
+ISSN_REGEX = re.compile(r"\b\d{4}-?\d{3}[\dXx]\b")
+ISBN_REGEX = re.compile(r"\b(?:97[89][-\s]?)?(?:\d[-\s]?){9,12}[\dXx]\b")
+EID_REGEX = re.compile(r"\b2-s2\.0-\d+\b", flags=re.IGNORECASE)
+YEAR_REGEX = re.compile(r"^\d{4}$")
+
+
+def clean_csv_header_value(value: str | None) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("\ufeff", "").strip()
+
+
+def strip_excel_separator_hint(csv_text: str) -> tuple[str, str | None]:
+    if not csv_text:
+        return csv_text, None
+
+    lines = csv_text.splitlines()
+    if not lines:
+        return csv_text, None
+
+    first_line = lines[0].strip()
+    match = re.match(r"^sep=(.)$", first_line, flags=re.IGNORECASE)
+    if not match:
+        return csv_text, None
+
+    delimiter = match.group(1)
+    remaining_text = "\n".join(lines[1:])
+    return remaining_text, delimiter
+
+
+def parse_csv_rows_with_delimiter(csv_text: str, delimiter: str) -> list[list[str]]:
+    reader = csv.reader(
+        io.StringIO(csv_text),
+        delimiter=delimiter,
+        quotechar='"',
+        doublequote=True,
+        skipinitialspace=False,
+    )
+
+    rows: list[list[str]] = []
+    for row in reader:
+        cleaned_row = [str(cell) if cell is not None else "" for cell in row]
+        if any(str(cell).strip() for cell in cleaned_row):
+            rows.append(cleaned_row)
+
+    return rows
+
+
+def get_expected_csv_header_aliases() -> set[str]:
+    aliases: set[str] = set()
+    for alias_list in COLUMN_ALIASES.values():
+        for alias in alias_list:
+            aliases.add(normalize_generic_text(alias))
+
+    extra_headers = [
+        "Author full names",
+        "Authors with affiliations",
+        "Publisher",
+        "Publication Stage",
+        "Source title",
+        "Document Type",
+        "Affiliations",
+    ]
+    for header in extra_headers:
+        aliases.add(normalize_generic_text(header))
+
+    return aliases
+
+
+def score_csv_header_match(headers: list[str]) -> int:
+    expected_aliases = get_expected_csv_header_aliases()
+    normalized_headers = [normalize_generic_text(clean_csv_header_value(h)) for h in headers]
+    return sum(1 for h in normalized_headers if h in expected_aliases)
+
+
+def score_csv_candidate(rows: list[list[str]]) -> int:
+    if not rows:
+        return -10_000
+
+    headers = rows[0]
+    header_count = len(headers)
+    if header_count == 0:
+        return -10_000
+
+    score = 0
+    score += score_csv_header_match(headers) * 100
+
+    preview_rows = rows[1: 1 + CSV_PARSE_PREVIEW_ROWS]
+    if not preview_rows:
+        return score
+
+    for row in preview_rows:
+        if len(row) == header_count:
+            score += 8
+        elif abs(len(row) - header_count) == 1:
+            score += 2
+        else:
+            score -= 10
+
+    return score
+
+
+def normalize_csv_row_length(row: list[str], headers: list[str]) -> list[str]:
+    expected = len(headers)
+    values = list(row)
+
+    if len(values) < expected:
+        values.extend([""] * (expected - len(values)))
+        return values
+
+    if len(values) > expected:
+        prefix = values[: expected - 1]
+        merged_tail = ",".join(v for v in values[expected - 1:] if v is not None)
+        return prefix + [merged_tail]
+
+    return values
+
+
+def build_dict_rows_from_csv_rows(rows: list[list[str]]) -> list[dict]:
+    if not rows:
+        return []
+
+    headers = [clean_csv_header_value(h) for h in rows[0]]
+    dict_rows: list[dict] = []
+
+    for raw_row in rows[1:]:
+        normalized_row = normalize_csv_row_length(raw_row, headers)
+        row_dict = {headers[idx]: normalized_row[idx].strip() for idx in range(len(headers))}
+        dict_rows.append(row_dict)
+
+    return dict_rows
+
+
+def extract_first_regex_match(value: str | None, pattern: re.Pattern[str]) -> str | None:
+    if not value:
+        return None
+    match = pattern.search(str(value))
+    if not match:
+        return None
+    return match.group(0).strip()
+
+
+def extract_all_regex_matches(value: str | None, pattern: re.Pattern[str]) -> list[str]:
+    if not value:
+        return []
+    matches = [m.group(0).strip() for m in pattern.finditer(str(value))]
+    return unique_keep_order(matches)
+
+
+def sanitize_short_field(value: str | None, max_length: int) -> str | None:
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned:
+        return None
+    if len(cleaned) <= max_length:
+        return cleaned
+    return cleaned[:max_length]
+
+
+def sanitize_year_field(value: str | None) -> str | None:
+    if not value:
+        return None
+    cleaned = str(value).strip()
+    if YEAR_REGEX.match(cleaned):
+        return cleaned
+
+    extracted = extract_first_regex_match(cleaned, re.compile(r"\b\d{4}\b"))
+    return extracted
+
+
+def sanitize_identifier_fields(mapped: dict) -> dict:
+    sanitized = dict(mapped)
+
+    sanitized["eid"] = extract_first_regex_match(sanitized.get("eid"), EID_REGEX) or sanitize_short_field(
+        sanitized.get("eid"), SQL_SAFE_MAX_LENGTHS["eid"]
+    )
+
+    sanitized["publication_year_raw"] = sanitize_year_field(sanitized.get("publication_year_raw"))
+    sanitized["scopus_year_raw"] = sanitize_year_field(sanitized.get("scopus_year_raw"))
+
+    issn_matches = extract_all_regex_matches(sanitized.get("issn_raw"), ISSN_REGEX)
+    sanitized["issn_raw"] = "; ".join(issn_matches) if issn_matches else sanitize_short_field(
+        sanitized.get("issn_raw"), SQL_SAFE_MAX_LENGTHS["issn_raw"]
+    )
+
+    isbn_matches = extract_all_regex_matches(sanitized.get("isbn_raw"), ISBN_REGEX)
+    sanitized["isbn_raw"] = "; ".join(isbn_matches) if isbn_matches else sanitize_short_field(
+        sanitized.get("isbn_raw"), SQL_SAFE_MAX_LENGTHS["isbn_raw"]
+    )
+
+    for field_name, max_length in SQL_SAFE_MAX_LENGTHS.items():
+        if field_name in {"eid", "publication_year_raw", "scopus_year_raw", "issn_raw", "isbn_raw"}:
+            continue
+        sanitized[field_name] = sanitize_short_field(sanitized.get(field_name), max_length)
+
+    return sanitized
+
+
 
 def coerce_choice(value: str | None, allowed_values: list[str]) -> str | None:
     if not value:
@@ -3702,6 +3919,8 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
         mapped["area_idic_raw"] = None
         mapped["linea_idic_raw"] = None
 
+    mapped = sanitize_identifier_fields(mapped)
+
     record_hash = compute_record_hash(
         mapped.get("eid"),
         mapped.get("doi_link_raw"),
@@ -3722,14 +3941,41 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
 
 
 def parse_csv_text(csv_text: str) -> list[dict]:
-    sample = csv_text[:4096]
-    try:
-        dialect = csv.Sniffer().sniff(sample)
-    except Exception:
-        dialect = csv.excel
+    normalized_text = (csv_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized_text, hinted_delimiter = strip_excel_separator_hint(normalized_text)
 
-    reader = csv.DictReader(io.StringIO(csv_text), dialect=dialect)
-    return list(reader)
+    candidate_delimiters = [hinted_delimiter] if hinted_delimiter else []
+    for delimiter in CSV_DELIMITER_CANDIDATES:
+        if delimiter not in candidate_delimiters:
+            candidate_delimiters.append(delimiter)
+
+    best_rows: list[list[str]] | None = None
+    best_score: int | None = None
+    best_delimiter: str | None = None
+
+    for delimiter in candidate_delimiters:
+        try:
+            parsed_rows = parse_csv_rows_with_delimiter(normalized_text, delimiter)
+        except Exception:
+            continue
+
+        candidate_score = score_csv_candidate(parsed_rows)
+        if best_score is None or candidate_score > best_score:
+            best_rows = parsed_rows
+            best_score = candidate_score
+            best_delimiter = delimiter
+
+    if not best_rows:
+        raise RuntimeError("Unable to parse CSV with supported delimiters.")
+
+    logging.info(
+        "CSV parsed using delimiter %r with score %s and %s data rows.",
+        best_delimiter,
+        best_score,
+        max(len(best_rows) - 1, 0),
+    )
+
+    return build_dict_rows_from_csv_rows(best_rows)
 
 
 def insert_rows_to_staging(

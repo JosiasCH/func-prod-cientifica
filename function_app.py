@@ -238,10 +238,10 @@ def choose_best_scored_candidate_with_margin(
 
 
 THEMATIC_FIELD_WEIGHTS = {
-    "title": 7,
-    "abstract": 5,
-    "author_keywords": 4,
-    "index_keywords": 3,
+    "abstract": 10,
+    "title": 4,
+    "author_keywords": 3,
+    "index_keywords": 2,
     "source_title": 1,
 }
 
@@ -651,6 +651,83 @@ def infer_careers_from_text(value: str | None) -> list[str]:
 def infer_career_from_text(value: str | None) -> str | None:
     careers = infer_careers_from_text(value)
     return careers[0] if careers else None
+
+
+VALID_ENGINEERING_CAREERS = [
+    "Ingeniería Industrial",
+    "Ingeniería Civil",
+    "Ingeniería de Sistemas",
+]
+
+VALID_SCOPUS_DOCUMENT_TYPES = {
+    "article",
+    "conference paper",
+}
+
+
+def filter_valid_engineering_careers(careers: list[str] | None) -> list[str]:
+    if not careers:
+        return []
+    return unique_keep_order([c for c in careers if c in VALID_ENGINEERING_CAREERS])
+
+
+def normalize_document_type_for_filter(value: str | None) -> str:
+    return normalize_generic_text(value)
+
+
+def is_valid_scopus_document_type(value: str | None) -> bool:
+    return normalize_document_type_for_filter(value) in VALID_SCOPUS_DOCUMENT_TYPES
+
+
+def resolve_engineering_careers_from_affiliation_text(*values: str | None) -> list[str]:
+    detected: list[str] = []
+    for value in values:
+        if not is_ulima_text(value):
+            continue
+        detected.extend(infer_careers_from_text(value))
+    return filter_valid_engineering_careers(detected)
+
+
+def determine_row_engineering_eligibility(
+    document_type_value: str | None,
+    authors_with_affiliations_value: str | None,
+    affiliations_value: str | None,
+    enrichment: dict,
+) -> dict:
+    normalized_doc_type = normalize_document_type_for_filter(document_type_value)
+    if normalized_doc_type not in VALID_SCOPUS_DOCUMENT_TYPES:
+        return {
+            "eligible": False,
+            "carrera_raw": None,
+            "reason": f"Invalid document type: {document_type_value or 'UNKNOWN'}",
+        }
+
+    careers_from_enrichment = filter_valid_engineering_careers(
+        split_semicolon_values(enrichment.get("carrera_raw"))
+    )
+    if careers_from_enrichment:
+        return {
+            "eligible": True,
+            "carrera_raw": "; ".join(careers_from_enrichment),
+            "reason": None,
+        }
+
+    careers_from_affiliation = resolve_engineering_careers_from_affiliation_text(
+        authors_with_affiliations_value,
+        affiliations_value,
+    )
+    if careers_from_affiliation:
+        return {
+            "eligible": True,
+            "carrera_raw": "; ".join(careers_from_affiliation),
+            "reason": None,
+        }
+
+    return {
+        "eligible": False,
+        "carrera_raw": None,
+        "reason": "Row excluded: no valid ULima engineering affiliation for Industrial/Civil/Systems.",
+    }
 
 
 # =========================
@@ -2408,8 +2485,9 @@ def build_career_classification_prompt(
     rules = [
         "Clasifica SOLO area_carrera_raw y linea_carrera_raw.",
         "No clasifiques campos IDIC en esta tarea.",
-        "Usa principalmente title y abstract_scopus para decidir el foco real del artículo.",
-        "Usa author_keywords e index_keywords como apoyo; usa source_title solo como evidencia débil.",
+        "Usa abstract_scopus como evidencia principal y criterio dominante para decidir el foco real del artículo.",
+        "Usa title, author_keywords e index_keywords solo como apoyo o corroboración.",
+        "Usa source_title solo como evidencia débil.",
         "Debes elegir solo valores existentes en el catálogo proporcionado.",
         "No inventes áreas ni líneas.",
         "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
@@ -2463,8 +2541,9 @@ def build_idic_classification_prompt(
     rules = [
         "Clasifica SOLO category_tematica_raw, area_idic_raw y linea_idic_raw.",
         "No clasifiques campos de Carrera en esta tarea.",
-        "Usa principalmente title y abstract_scopus para decidir el foco real del artículo.",
-        "Usa author_keywords e index_keywords como apoyo; usa source_title solo como evidencia débil.",
+        "Usa abstract_scopus como evidencia principal y criterio dominante para decidir el foco real del artículo.",
+        "Usa title, author_keywords e index_keywords solo como apoyo o corroboración.",
+        "Usa source_title solo como evidencia débil.",
         "Debes elegir solo valores existentes en el catálogo proporcionado.",
         "No inventes categorías, áreas ni líneas.",
         "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
@@ -3999,6 +4078,33 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
     elif mapped.get("eid") and not mapped.get("metodo_cruce_scopus_raw"):
         mapped["metodo_cruce_scopus_raw"] = "EID"
 
+    eligibility = determine_row_engineering_eligibility(
+        document_type_value=document_type_value,
+        authors_with_affiliations_value=authors_with_affiliations_value,
+        affiliations_value=affiliations_value,
+        enrichment=enrichment,
+    )
+
+    if eligibility.get("carrera_raw"):
+        mapped["carrera_raw"] = eligibility.get("carrera_raw")
+
+    if not eligibility.get("eligible"):
+        mapped["area_carrera_raw"] = None
+        mapped["linea_carrera_raw"] = None
+        mapped["category_tematica_raw"] = None
+        mapped["area_idic_raw"] = None
+        mapped["linea_idic_raw"] = None
+        mapped = sanitize_identifier_fields(mapped)
+        mapped["record_hash"] = compute_record_hash(
+            mapped.get("eid"),
+            mapped.get("doi_link_raw"),
+            mapped.get("publication_title_raw"),
+        )
+        mapped["is_valid_for_curated"] = 0
+        mapped["rejection_reason"] = eligibility.get("reason")
+        mapped["__skip_insert__"] = True
+        return mapped
+
     # -------------------------
     # Thematic classification
     # -------------------------
@@ -4065,6 +4171,7 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
     mapped["record_hash"] = record_hash
     mapped["is_valid_for_curated"] = 1 if has_identity else 0
     mapped["rejection_reason"] = None if has_identity else "Missing EID/DOI/title"
+    mapped["__skip_insert__"] = False
 
     return mapped
 
@@ -4124,6 +4231,10 @@ def insert_rows_to_staging(
 
         for idx, row in enumerate(rows, start=1):
             mapped = map_row_to_staging(row, docentes_ref=docentes_ref)
+
+            if mapped.get("__skip_insert__"):
+                rejected += 1
+                continue
 
             cursor.execute(
                 """

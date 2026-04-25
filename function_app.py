@@ -2012,6 +2012,107 @@ def set_first_justification(result: dict, justification: str | None) -> None:
         result["justification"] = justification
 
 
+def classify_career_dimensions_force_best(
+    carrera: str | None,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> dict:
+    if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
+        return {"area_carrera_raw": None, "linea_carrera_raw": None}
+
+    text_fields = build_thematic_text_fields(
+        title_value,
+        abstract_value,
+        author_keywords_value,
+        index_keywords_value,
+        source_title_value,
+    )
+
+    line_scores: dict[str, int] = {}
+    for area_name, lineas in CAREER_AREA_LINE_CATALOG[carrera].items():
+        for linea in lineas:
+            primary_aliases = [linea]
+            support_aliases = [area_name]
+            support_aliases.extend(CAREER_LINE_HINTS.get(carrera, {}).get(linea, []))
+            score = build_weighted_candidate_score(
+                text_fields=text_fields,
+                primary_aliases=primary_aliases,
+                support_aliases=support_aliases,
+            )
+            score = apply_industrial_line_bonus(carrera, linea, text_fields, score)
+            line_scores[linea] = score
+
+    eligible = [
+        linea for linea in line_scores.keys()
+        if is_line_eligible_by_domain_rules(carrera, linea, text_fields)
+    ]
+    candidate_pool = eligible or list(line_scores.keys())
+    if not candidate_pool:
+        return {"area_carrera_raw": None, "linea_carrera_raw": None}
+
+    candidate_pool.sort(key=lambda x: (-line_scores.get(x, 0), normalize_generic_text(x)))
+    best_linea = candidate_pool[0]
+    best_area = coerce_area_carrera_from_linea(carrera, best_linea)
+    return {"area_carrera_raw": best_area, "linea_carrera_raw": best_linea}
+
+
+def classify_idic_dimensions_force_best(
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> dict:
+    text_fields = build_thematic_text_fields(
+        title_value,
+        abstract_value,
+        author_keywords_value,
+        index_keywords_value,
+        source_title_value,
+    )
+
+    line_scores: dict[str, int] = {}
+    for category_name, areas in IDIC_CATEGORY_AREA_LINE_CATALOG.items():
+        for area_name, lineas in areas.items():
+            for linea in lineas:
+                primary_aliases = [linea]
+                support_aliases = [area_name, category_name]
+                support_aliases.extend(IDIC_LINE_HINTS.get(linea, []))
+                line_scores[linea] = build_weighted_candidate_score(
+                    text_fields=text_fields,
+                    primary_aliases=primary_aliases,
+                    support_aliases=support_aliases,
+                )
+
+    if not line_scores:
+        return {
+            "category_tematica_raw": None,
+            "area_idic_raw": None,
+            "linea_idic_raw": None,
+        }
+
+    ranked = sorted(line_scores.keys(), key=lambda x: (-line_scores.get(x, 0), normalize_generic_text(x)))
+    best_linea = ranked[0]
+    best_area = coerce_area_idic_from_linea(best_linea)
+    best_category = coerce_category_tematica_from_area(best_area)
+
+    if not is_valid_idic_triplet(best_category, best_area, best_linea):
+        return {
+            "category_tematica_raw": None,
+            "area_idic_raw": None,
+            "linea_idic_raw": None,
+        }
+
+    return {
+        "category_tematica_raw": best_category,
+        "area_idic_raw": best_area,
+        "linea_idic_raw": best_linea,
+    }
+
+
 def classify_career_dimensions_by_hints(
     carrera: str | None,
     title_value: str | None,
@@ -2748,6 +2849,34 @@ def classify_thematic_fields(
         merged["category_tematica_raw"] = None
         merged["area_idic_raw"] = None
         merged["linea_idic_raw"] = None
+
+    # Fallback final obligatorio: no dejar NULLs temáticos
+    if any(not merged.get(field) for field in career_fields):
+        career_forced = classify_career_dimensions_force_best(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+        merged = merge_non_null_fields(merged, career_forced, career_fields)
+        if any(career_forced.get(field) for field in career_fields):
+            append_classification_source(merged, "career_force_best")
+            set_first_justification(merged, "Fallback final obligatorio de carrera para evitar NULLs.")
+
+    if any(not merged.get(field) for field in idic_fields):
+        idic_forced = classify_idic_dimensions_force_best(
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+        merged = merge_non_null_fields(merged, idic_forced, idic_fields)
+        if any(idic_forced.get(field) for field in idic_fields):
+            append_classification_source(merged, "idic_force_best")
+            set_first_justification(merged, "Fallback final obligatorio de IDIC para evitar NULLs.")
 
     return merged
 

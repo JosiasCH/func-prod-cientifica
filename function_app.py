@@ -1402,6 +1402,250 @@ def build_classification_score(corpus: str, aliases: list[str]) -> int:
     return score
 
 
+INDUSTRIAL_ORA_STRONG_SIGNALS = [
+    "optimization",
+    "optimisation",
+    "optimizing",
+    "optimising",
+    "mathematical model",
+    "mathematical modeling",
+    "mathematical modelling",
+    "modelamiento matematico",
+    "prediction",
+    "predictive",
+    "forecast",
+    "forecasting",
+    "simulation",
+    "simulacion",
+    "benchmarking",
+    "cross validation",
+    "cross-validation",
+    "particle swarm optimization",
+    "genetic algorithm",
+    "decision support",
+    "machine learning",
+    "deep learning",
+    "algorithm",
+    "algoritmo",
+]
+
+INDUSTRIAL_SCM_STRONG_SIGNALS = [
+    "inventory",
+    "inventory management",
+    "warehouse",
+    "warehouse management",
+    "storage center",
+    "logistics",
+    "transportation",
+    "transport",
+    "supply chain",
+    "inventarios",
+    "almacenes",
+    "almacen",
+    "logistica",
+    "transportes",
+    "cadena de suministro",
+    "supplier",
+    "proveedores",
+    "otif",
+]
+
+INDUSTRIAL_OEM_STRONG_SIGNALS = [
+    "5s",
+    "standard work",
+    "lean",
+    "kaizen",
+    "operations management",
+    "gestion de operaciones",
+    "planeamiento de operaciones",
+    "process improvement",
+    "continuous improvement",
+    "operational efficiency",
+    "productivity improvement",
+    "maintenance",
+    "mantenimiento",
+]
+
+INDUSTRIAL_PDD_STRONG_SIGNALS = [
+    "product development",
+    "desarrollo de producto",
+    "product design",
+    "diseno de producto",
+    "prototype",
+    "prototipo",
+    "materials",
+    "material",
+    "advanced material",
+    "composite",
+    "formulation",
+    "synthesis",
+    "green synthesis",
+    "nanoparticles",
+    "silver nanoparticles",
+    "fibres",
+    "fibers",
+    "asphalt",
+    "stone mastic asphalt",
+    "characterization",
+    "characterisation",
+    "valorization",
+    "valorisation",
+]
+
+
+def contains_any_phrase_in_text_fields(text_fields: dict[str, str], phrases: list[str]) -> bool:
+    for phrase in phrases:
+        norm_phrase = normalize_generic_text(phrase)
+        if not norm_phrase:
+            continue
+        for text_value in text_fields.values():
+            if text_value and phrase_in_text(text_value, norm_phrase):
+                return True
+    return False
+
+
+def count_phrase_hits_in_text(value: str | None, phrases: list[str]) -> int:
+    norm_value = normalize_generic_text(value)
+    if not norm_value:
+        return 0
+
+    hits = 0
+    seen: set[str] = set()
+    for phrase in phrases:
+        norm_phrase = normalize_generic_text(phrase)
+        if not norm_phrase or norm_phrase in seen:
+            continue
+        if phrase_in_text(norm_value, norm_phrase):
+            hits += 1
+            seen.add(norm_phrase)
+    return hits
+
+
+def is_line_eligible_by_domain_rules(carrera: str, linea: str, text_fields: dict[str, str]) -> bool:
+    if carrera != "Ingeniería Industrial":
+        return True
+
+    if linea in (
+        "Modelamiento matemático a la mejora de procesos como soporte a la toma de decisiones",
+        "Simulación para la mejora del diseño de procesos",
+        "Diseño y desarrollo de modelos para el análisis y predicción de las variables de un proceso",
+    ):
+        return contains_any_phrase_in_text_fields(text_fields, INDUSTRIAL_ORA_STRONG_SIGNALS)
+
+    return True
+
+
+def apply_industrial_line_bonus(carrera: str, linea: str, text_fields: dict[str, str], base_score: int) -> int:
+    if carrera != "Ingeniería Industrial":
+        return base_score
+
+    title_text = text_fields.get("title")
+    abstract_text = text_fields.get("abstract")
+    keyword_text = " | ".join(
+        [
+            text_fields.get("author_keywords", ""),
+            text_fields.get("index_keywords", ""),
+        ]
+    )
+
+    if linea in (
+        "Modelamiento matemático a la mejora de procesos como soporte a la toma de decisiones",
+        "Simulación para la mejora del diseño de procesos",
+        "Diseño y desarrollo de modelos para el análisis y predicción de las variables de un proceso",
+    ):
+        bonus = 0
+        bonus += 3 * count_phrase_hits_in_text(title_text, INDUSTRIAL_ORA_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, INDUSTRIAL_ORA_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(keyword_text, INDUSTRIAL_ORA_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Gestión de Inventarios, Almacenes y Transportes":
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, INDUSTRIAL_SCM_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, INDUSTRIAL_SCM_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, INDUSTRIAL_SCM_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Gestión de la cadena de suministro":
+        bonus = 0
+        bonus += 3 * count_phrase_hits_in_text(title_text, INDUSTRIAL_SCM_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, INDUSTRIAL_SCM_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, INDUSTRIAL_SCM_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Planeamiento y Gestión de Operaciones":
+        bonus = 0
+        bonus += 3 * count_phrase_hits_in_text(title_text, INDUSTRIAL_OEM_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, INDUSTRIAL_OEM_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, INDUSTRIAL_OEM_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea in ("Diseño de producto", "Desarrollo de producto"):
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, INDUSTRIAL_PDD_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, INDUSTRIAL_PDD_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, INDUSTRIAL_PDD_STRONG_SIGNALS)
+        return base_score + bonus
+
+    return base_score
+
+
+def choose_best_line_with_rules(
+    carrera: str,
+    score_map: dict[str, int],
+    text_fields: dict[str, str],
+    min_score: int,
+    min_margin: int = 1,
+    relaxed: bool = False,
+) -> str | None:
+    filtered: list[tuple[str, int]] = []
+
+    for linea, score in score_map.items():
+        if score < min_score:
+            continue
+        if not is_line_eligible_by_domain_rules(carrera, linea, text_fields):
+            continue
+        adjusted_score = apply_industrial_line_bonus(carrera, linea, text_fields, score)
+        filtered.append((linea, adjusted_score))
+
+    if not filtered:
+        return None
+
+    filtered.sort(key=lambda x: (-x[1], normalize_generic_text(x[0])))
+
+    if relaxed:
+        return filtered[0][0]
+
+    best_linea, best_score = filtered[0]
+    tied = [linea for linea, score in filtered if score == best_score]
+    if len(tied) > 1:
+        return None
+
+    if len(filtered) > 1:
+        second_score = filtered[1][1]
+        if (best_score - second_score) < min_margin:
+            return None
+
+    return best_linea
+
+
+def append_classification_source(result: dict, source_name: str) -> None:
+    current = result.get("classification_mode")
+    if not current:
+        result["classification_mode"] = source_name
+        return
+
+    parts = [p.strip() for p in str(current).split("|") if p.strip()]
+    if source_name not in parts:
+        parts.append(source_name)
+    result["classification_mode"] = "|".join(parts)
+
+
+def set_first_justification(result: dict, justification: str | None) -> None:
+    if justification and not result.get("justification"):
+        result["justification"] = justification
+
+
 def classify_career_dimensions_by_hints(
     carrera: str | None,
     title_value: str | None,
@@ -1436,10 +1680,13 @@ def classify_career_dimensions_by_hints(
                 support_aliases=support_aliases,
             )
 
-    best_linea = choose_best_scored_candidate_with_margin(
-        line_scores,
+    best_linea = choose_best_line_with_rules(
+        carrera=carrera,
+        score_map=line_scores,
+        text_fields=text_fields,
         min_score=THEMATIC_STRICT_MIN_SCORE,
         min_margin=THEMATIC_STRICT_MIN_MARGIN,
+        relaxed=False,
     )
     best_area = coerce_area_carrera_from_linea(carrera, best_linea) if best_linea else None
 
@@ -1480,9 +1727,13 @@ def classify_career_dimensions_by_hints_approx(
                 support_aliases=support_aliases,
             )
 
-    best_linea = choose_best_scored_candidate_relaxed(
-        line_scores,
+    best_linea = choose_best_line_with_rules(
+        carrera=carrera,
+        score_map=line_scores,
+        text_fields=text_fields,
         min_score=THEMATIC_APPROX_MIN_SCORE,
+        min_margin=1,
+        relaxed=True,
     )
     best_area = coerce_area_carrera_from_linea(carrera, best_linea) if best_linea else None
 
@@ -1671,7 +1922,7 @@ def build_thematic_empty_result() -> dict:
     }
 
 
-def build_thematic_classification_prompt(
+def build_career_classification_prompt(
     carrera: str,
     title_value: str | None,
     abstract_value: str | None,
@@ -1682,49 +1933,31 @@ def build_thematic_classification_prompt(
 ) -> str:
     career_catalog = CAREER_AREA_LINE_CATALOG.get(carrera, {})
 
-    if mode == "approx":
-        classifier_role = (
-            "Eres un clasificador temático académico que debe elegir la opción más cercana y defendible "
-            "cuando no exista evidencia suficiente para una clasificación exacta."
-        )
-        rules = [
-            "Trabaja con catálogo cerrado: solo puedes devolver valores existentes en los catálogos proporcionados.",
-            "No inventes áreas, líneas ni categorías.",
-            "El artículo pertenece a la carrera indicada; la clasificación de carrera debe quedar dentro de esa carrera.",
-            "Distingue claramente author_keywords de index_keywords: no son lo mismo y deben tratarse como evidencias separadas.",
-            "Usa principalmente title y abstract_scopus para decidir el problema central, el objeto de estudio y el aporte principal.",
-            "Usa author_keywords e index_keywords como apoyo; usa source_title solo como evidencia débil.",
-            "Primero intenta una clasificación exacta.",
-            "Si no hay evidencia suficiente para exactitud total, elige la opción más cercana y defendible dentro del catálogo.",
-            "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
-            "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
-            "Evita clasificar por palabras genéricas muy amplias si el título y resumen apuntan a un tema más específico.",
-            "Si realmente no hay base razonable, devuelve null.",
-            "Devuelve únicamente JSON válido, sin markdown ni comentarios.",
-        ]
+    rules = [
+        "Clasifica SOLO area_carrera_raw y linea_carrera_raw.",
+        "No clasifiques campos IDIC en esta tarea.",
+        "Usa principalmente title y abstract_scopus para decidir el foco real del artículo.",
+        "Usa author_keywords e index_keywords como apoyo; usa source_title solo como evidencia débil.",
+        "Debes elegir solo valores existentes en el catálogo proporcionado.",
+        "No inventes áreas ni líneas.",
+        "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
+        "Para Ingeniería Industrial, NO elijas 'Operations Research & Analysis' salvo que el aporte central sea modelamiento, optimización, predicción, benchmarking, simulación o algoritmos.",
+        "Para Ingeniería Industrial, favorece 'Supply Chain Management' cuando el foco sea inventarios, almacenes, logística, transporte, proveedores, cadena de suministro u OTIF.",
+        "Para Ingeniería Industrial, favorece 'Operations Engineering & Management' cuando el foco sea 5S, standard work, lean, mejora de procesos, eficiencia operativa o gestión de operaciones.",
+        "Para Ingeniería Industrial, favorece 'Product Design & Development' cuando el foco sea síntesis, materiales, fibras, nanopartículas, formulación, caracterización o desarrollo de producto/material.",
+        "Evita decidir solo por palabras amplias si el título y el resumen apuntan a un tema más específico.",
+    ]
+
+    if mode == "strict":
+        rules.append("Si no hay evidencia suficiente, devuelve null en los campos inciertos.")
     else:
-        classifier_role = (
-            "Eres un clasificador temático estricto para publicaciones académicas de ingeniería."
-        )
-        rules = [
-            "Trabaja con catálogo cerrado: solo puedes devolver valores existentes en los catálogos proporcionados.",
-            "No inventes áreas, líneas ni categorías.",
-            "El artículo pertenece a la carrera indicada; la clasificación de carrera debe quedar dentro de esa carrera.",
-            "Distingue claramente author_keywords de index_keywords: no son lo mismo y deben tratarse como evidencias separadas.",
-            "Usa principalmente title y abstract_scopus para decidir el problema central, el objeto de estudio y el aporte principal.",
-            "Usa author_keywords e index_keywords como apoyo; usa source_title solo como evidencia débil.",
-            "Si no hay evidencia suficiente, devuelve null en los campos inciertos.",
-            "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
-            "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
-            "Evita clasificar por palabras genéricas muy amplias si el título y resumen apuntan a un tema más específico.",
-            "Devuelve únicamente JSON válido, sin markdown ni comentarios.",
-        ]
+        rules.append("Si no hay evidencia exacta, elige la opción más cercana y defendible dentro del catálogo.")
 
     payload = {
         "mode": mode,
+        "task": "career_only",
         "carrera": carrera,
         "career_catalog": career_catalog,
-        "idic_catalog": IDIC_CATEGORY_AREA_LINE_CATALOG,
         "article": {
             "title": clip_text(title_value, 2000),
             "abstract_scopus": clip_text(abstract_value, 9000),
@@ -1735,6 +1968,55 @@ def build_thematic_classification_prompt(
         "output_schema": {
             "area_carrera_raw": "string|null",
             "linea_carrera_raw": "string|null",
+            "confidence": "number 0..1",
+            "justification": "short string",
+        },
+        "rules": rules,
+    }
+
+    return (
+        "Eres un clasificador temático académico. Analiza el artículo y clasifica solo la dimensión Carrera.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def build_idic_classification_prompt(
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+    mode: str = "strict",
+) -> str:
+    rules = [
+        "Clasifica SOLO category_tematica_raw, area_idic_raw y linea_idic_raw.",
+        "No clasifiques campos de Carrera en esta tarea.",
+        "Usa principalmente title y abstract_scopus para decidir el foco real del artículo.",
+        "Usa author_keywords e index_keywords como apoyo; usa source_title solo como evidencia débil.",
+        "Debes elegir solo valores existentes en el catálogo proporcionado.",
+        "No inventes categorías, áreas ni líneas.",
+        "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
+        "Distingue claramente entre enfoques de tecnología digital, sostenibilidad y comportamiento humano según el aporte central del artículo.",
+        "Evita decidir solo por palabras amplias si el título y el resumen apuntan a un tema más específico.",
+    ]
+
+    if mode == "strict":
+        rules.append("Si no hay evidencia suficiente, devuelve null en los campos inciertos.")
+    else:
+        rules.append("Si no hay evidencia exacta, elige la opción más cercana y defendible dentro del catálogo.")
+
+    payload = {
+        "mode": mode,
+        "task": "idic_only",
+        "idic_catalog": IDIC_CATEGORY_AREA_LINE_CATALOG,
+        "article": {
+            "title": clip_text(title_value, 2000),
+            "abstract_scopus": clip_text(abstract_value, 9000),
+            "author_keywords": clip_text(author_keywords_value, 2000),
+            "index_keywords": clip_text(index_keywords_value, 2000),
+            "source_title": clip_text(source_title_value, 1000),
+        },
+        "output_schema": {
             "category_tematica_raw": "string|null",
             "area_idic_raw": "string|null",
             "linea_idic_raw": "string|null",
@@ -1745,13 +2027,12 @@ def build_thematic_classification_prompt(
     }
 
     return (
-        f"{classifier_role} "
-        "Analiza el artículo y clasifica usando únicamente el catálogo cerrado proporcionado.\n\n"
+        "Eres un clasificador temático académico. Analiza el artículo y clasifica solo la dimensión IDIC.\n\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 
 
-def validate_llm_thematic_output(
+def validate_llm_career_output(
     carrera: str | None,
     raw_output: dict | None,
     mode: str = "strict",
@@ -1764,7 +2045,7 @@ def validate_llm_thematic_output(
     confidence = parse_float_or_none(raw_output.get("confidence"))
     result["confidence"] = confidence
     result["justification"] = raw_output.get("justification")
-    result["classification_mode"] = mode
+    result["classification_mode"] = f"career_llm_{mode}"
 
     area_carrera = coerce_choice(raw_output.get("area_carrera_raw"), get_allowed_career_areas(carrera))
     linea_carrera = coerce_choice(raw_output.get("linea_carrera_raw"), get_allowed_career_lines(carrera))
@@ -1775,6 +2056,29 @@ def validate_llm_thematic_output(
     if not is_valid_career_area_line(carrera, area_carrera, linea_carrera):
         area_carrera = None
         linea_carrera = None
+
+    min_confidence = get_thematic_llm_min_confidence(mode=mode)
+    if confidence is not None and confidence < min_confidence:
+        return build_thematic_empty_result()
+
+    result["area_carrera_raw"] = area_carrera
+    result["linea_carrera_raw"] = linea_carrera
+    return result
+
+
+def validate_llm_idic_output(
+    raw_output: dict | None,
+    mode: str = "strict",
+) -> dict:
+    result = build_thematic_empty_result()
+
+    if not raw_output:
+        return result
+
+    confidence = parse_float_or_none(raw_output.get("confidence"))
+    result["confidence"] = confidence
+    result["justification"] = raw_output.get("justification")
+    result["classification_mode"] = f"idic_llm_{mode}"
 
     category_tematica = coerce_choice(raw_output.get("category_tematica_raw"), get_allowed_idic_categories())
     area_idic = coerce_choice(raw_output.get("area_idic_raw"), get_allowed_idic_areas(category_tematica))
@@ -1802,15 +2106,13 @@ def validate_llm_thematic_output(
     if confidence is not None and confidence < min_confidence:
         return build_thematic_empty_result()
 
-    result["area_carrera_raw"] = area_carrera
-    result["linea_carrera_raw"] = linea_carrera
     result["category_tematica_raw"] = category_tematica
     result["area_idic_raw"] = area_idic
     result["linea_idic_raw"] = linea_idic
     return result
 
 
-def classify_thematic_fields_with_llm(
+def classify_career_with_llm(
     carrera: str | None,
     title_value: str | None,
     abstract_value: str | None,
@@ -1827,7 +2129,7 @@ def classify_thematic_fields_with_llm(
     if not is_thematic_llm_configured():
         return empty_result
 
-    prompt = build_thematic_classification_prompt(
+    prompt = build_career_classification_prompt(
         carrera=carrera,
         title_value=title_value,
         abstract_value=abstract_value,
@@ -1846,13 +2148,54 @@ def classify_thematic_fields_with_llm(
 
         raw_output = extract_json_object(getattr(response, "output_text", None))
         if not raw_output:
-            logging.warning("Thematic LLM (%s) returned non-JSON output.", mode)
+            logging.warning("Career LLM (%s) returned non-JSON output.", mode)
             return empty_result
 
-        return validate_llm_thematic_output(carrera, raw_output, mode=mode)
+        return validate_llm_career_output(carrera, raw_output, mode=mode)
 
     except Exception as exc:
-        logging.warning("Thematic LLM classification failed (%s): %s", mode, str(exc))
+        logging.warning("Career LLM classification failed (%s): %s", mode, str(exc))
+        return empty_result
+
+
+def classify_idic_with_llm(
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+    mode: str = "strict",
+) -> dict:
+    empty_result = build_thematic_empty_result()
+
+    if not is_thematic_llm_configured():
+        return empty_result
+
+    prompt = build_idic_classification_prompt(
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+        mode=mode,
+    )
+
+    try:
+        client = get_azure_openai_client()
+        response = client.responses.create(
+            model=get_env("AZURE_OPENAI_RESPONSES_MODEL"),
+            input=prompt,
+        )
+
+        raw_output = extract_json_object(getattr(response, "output_text", None))
+        if not raw_output:
+            logging.warning("IDIC LLM (%s) returned non-JSON output.", mode)
+            return empty_result
+
+        return validate_llm_idic_output(raw_output, mode=mode)
+
+    except Exception as exc:
+        logging.warning("IDIC LLM classification failed (%s): %s", mode, str(exc))
         return empty_result
 
 
@@ -1869,16 +2212,13 @@ def classify_thematic_fields(
     if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
         return merged
 
-    all_fields = [
-        "area_carrera_raw",
-        "linea_carrera_raw",
-        "category_tematica_raw",
-        "area_idic_raw",
-        "linea_idic_raw",
-    ]
+    career_fields = ["area_carrera_raw", "linea_carrera_raw"]
+    idic_fields = ["category_tematica_raw", "area_idic_raw", "linea_idic_raw"]
 
-    # 1) LLM strict para todo
-    strict_result = classify_thematic_fields_with_llm(
+    # -------------------------
+    # A. CARRERA
+    # -------------------------
+    career_strict = classify_career_with_llm(
         carrera=carrera,
         title_value=title_value,
         abstract_value=abstract_value,
@@ -1887,19 +2227,15 @@ def classify_thematic_fields(
         source_title_value=source_title_value,
         mode="strict",
     )
+    merged = merge_non_null_fields(merged, career_strict, career_fields)
+    if any(career_strict.get(field) for field in career_fields):
+        append_classification_source(merged, "career_llm_strict")
+        if career_strict.get("confidence") is not None and merged.get("confidence") is None:
+            merged["confidence"] = career_strict.get("confidence")
+        set_first_justification(merged, career_strict.get("justification"))
 
-    merged = merge_non_null_fields(merged, strict_result, all_fields)
-
-    if strict_result.get("confidence") is not None:
-        merged["confidence"] = strict_result.get("confidence")
-    if strict_result.get("justification"):
-        merged["justification"] = strict_result.get("justification")
-    if strict_result.get("classification_mode"):
-        merged["classification_mode"] = strict_result.get("classification_mode")
-
-    # 2) LLM approx para cualquier campo faltante
-    if missing_thematic_fields(merged):
-        approx_result = classify_thematic_fields_with_llm(
+    if any(not merged.get(field) for field in career_fields):
+        career_approx = classify_career_with_llm(
             carrera=carrera,
             title_value=title_value,
             abstract_value=abstract_value,
@@ -1908,24 +2244,15 @@ def classify_thematic_fields(
             source_title_value=source_title_value,
             mode="approx",
         )
+        merged = merge_non_null_fields(merged, career_approx, career_fields)
+        if any(career_approx.get(field) for field in career_fields):
+            append_classification_source(merged, "career_llm_approx")
+            if career_approx.get("confidence") is not None and merged.get("confidence") is None:
+                merged["confidence"] = career_approx.get("confidence")
+            set_first_justification(merged, career_approx.get("justification"))
 
-        merged = merge_non_null_fields(merged, approx_result, all_fields)
-
-        if (
-            has_any_thematic_field(approx_result)
-            and merged.get("classification_mode") != "strict"
-        ):
-            merged["classification_mode"] = approx_result.get("classification_mode") or "approx"
-
-        if merged.get("confidence") is None and approx_result.get("confidence") is not None:
-            merged["confidence"] = approx_result.get("confidence")
-
-        if not merged.get("justification") and approx_result.get("justification"):
-            merged["justification"] = approx_result.get("justification")
-
-    # 3) Hints strict para carrera + IDIC
-    if missing_thematic_fields(merged):
-        career_hint_result = classify_career_dimensions_by_hints(
+    if any(not merged.get(field) for field in career_fields):
+        career_hint = classify_career_dimensions_by_hints(
             carrera=carrera,
             title_value=title_value,
             abstract_value=abstract_value,
@@ -1933,34 +2260,12 @@ def classify_thematic_fields(
             index_keywords_value=index_keywords_value,
             source_title_value=source_title_value,
         )
-        idic_hint_result = classify_idic_dimensions_by_hints(
-            title_value=title_value,
-            abstract_value=abstract_value,
-            author_keywords_value=author_keywords_value,
-            index_keywords_value=index_keywords_value,
-            source_title_value=source_title_value,
-        )
+        merged = merge_non_null_fields(merged, career_hint, career_fields)
+        if any(career_hint.get(field) for field in career_fields):
+            append_classification_source(merged, "career_hints_strict")
 
-        merged = merge_non_null_fields(
-            merged,
-            {
-                "area_carrera_raw": career_hint_result.get("area_carrera_raw"),
-                "linea_carrera_raw": career_hint_result.get("linea_carrera_raw"),
-                "category_tematica_raw": idic_hint_result.get("category_tematica_raw"),
-                "area_idic_raw": idic_hint_result.get("area_idic_raw"),
-                "linea_idic_raw": idic_hint_result.get("linea_idic_raw"),
-            },
-            all_fields,
-        )
-
-        if not merged.get("classification_mode") and (
-            has_any_thematic_field(career_hint_result) or has_any_thematic_field(idic_hint_result)
-        ):
-            merged["classification_mode"] = "hints_strict"
-
-    # 4) Hints approx para carrera + IDIC
-    if missing_thematic_fields(merged):
-        career_hint_approx_result = classify_career_dimensions_by_hints_approx(
+    if any(not merged.get(field) for field in career_fields):
+        career_hint_approx = classify_career_dimensions_by_hints_approx(
             carrera=carrera,
             title_value=title_value,
             abstract_value=abstract_value,
@@ -1968,31 +2273,67 @@ def classify_thematic_fields(
             index_keywords_value=index_keywords_value,
             source_title_value=source_title_value,
         )
-        idic_hint_approx_result = classify_idic_dimensions_by_hints_approx(
+        merged = merge_non_null_fields(merged, career_hint_approx, career_fields)
+        if any(career_hint_approx.get(field) for field in career_fields):
+            append_classification_source(merged, "career_hints_approx")
+
+    # -------------------------
+    # B. IDIC
+    # -------------------------
+    idic_strict = classify_idic_with_llm(
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+        mode="strict",
+    )
+    merged = merge_non_null_fields(merged, idic_strict, idic_fields)
+    if any(idic_strict.get(field) for field in idic_fields):
+        append_classification_source(merged, "idic_llm_strict")
+        if idic_strict.get("confidence") is not None and merged.get("confidence") is None:
+            merged["confidence"] = idic_strict.get("confidence")
+        set_first_justification(merged, idic_strict.get("justification"))
+
+    if any(not merged.get(field) for field in idic_fields):
+        idic_approx = classify_idic_with_llm(
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+            mode="approx",
+        )
+        merged = merge_non_null_fields(merged, idic_approx, idic_fields)
+        if any(idic_approx.get(field) for field in idic_fields):
+            append_classification_source(merged, "idic_llm_approx")
+            if idic_approx.get("confidence") is not None and merged.get("confidence") is None:
+                merged["confidence"] = idic_approx.get("confidence")
+            set_first_justification(merged, idic_approx.get("justification"))
+
+    if any(not merged.get(field) for field in idic_fields):
+        idic_hint = classify_idic_dimensions_by_hints(
             title_value=title_value,
             abstract_value=abstract_value,
             author_keywords_value=author_keywords_value,
             index_keywords_value=index_keywords_value,
             source_title_value=source_title_value,
         )
+        merged = merge_non_null_fields(merged, idic_hint, idic_fields)
+        if any(idic_hint.get(field) for field in idic_fields):
+            append_classification_source(merged, "idic_hints_strict")
 
-        merged = merge_non_null_fields(
-            merged,
-            {
-                "area_carrera_raw": career_hint_approx_result.get("area_carrera_raw"),
-                "linea_carrera_raw": career_hint_approx_result.get("linea_carrera_raw"),
-                "category_tematica_raw": idic_hint_approx_result.get("category_tematica_raw"),
-                "area_idic_raw": idic_hint_approx_result.get("area_idic_raw"),
-                "linea_idic_raw": idic_hint_approx_result.get("linea_idic_raw"),
-            },
-            all_fields,
+    if any(not merged.get(field) for field in idic_fields):
+        idic_hint_approx = classify_idic_dimensions_by_hints_approx(
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
         )
-
-        if not merged.get("classification_mode") and (
-            has_any_thematic_field(career_hint_approx_result)
-            or has_any_thematic_field(idic_hint_approx_result)
-        ):
-            merged["classification_mode"] = "hints_approx"
+        merged = merge_non_null_fields(merged, idic_hint_approx, idic_fields)
+        if any(idic_hint_approx.get(field) for field in idic_fields):
+            append_classification_source(merged, "idic_hints_approx")
 
     # Validación final
     if not is_valid_career_area_line(

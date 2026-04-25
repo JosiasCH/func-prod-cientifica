@@ -1493,6 +1493,38 @@ INDUSTRIAL_PDD_STRONG_SIGNALS = [
 ]
 
 
+IDIC_INNOVATION_MANAGEMENT_STRONG_SIGNALS = [
+    "5s",
+    "standard work",
+    "lean",
+    "kaizen",
+    "continuous improvement",
+    "process improvement",
+    "improvement model",
+    "operational efficiency",
+    "productivity improvement",
+    "innovation management",
+    "gestion de la innovacion",
+    "workflow improvement",
+    "mejora de procesos",
+]
+
+IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS = [
+    "organizational transformation",
+    "organisational transformation",
+    "transformacion organizacional",
+    "organizational change",
+    "organisational change",
+    "change management",
+    "business transformation",
+    "process redesign",
+    "workflow redesign",
+    "organizational redesign",
+    "restructuring",
+    "digital transformation",
+]
+
+
 def contains_any_phrase_in_text_fields(text_fields: dict[str, str], phrases: list[str]) -> bool:
     for phrase in phrases:
         norm_phrase = normalize_generic_text(phrase)
@@ -1627,6 +1659,123 @@ def choose_best_line_with_rules(
             return None
 
     return best_linea
+
+
+
+def is_idic_line_eligible_by_domain_rules(linea: str, text_fields: dict[str, str]) -> bool:
+    innovation_present = contains_any_phrase_in_text_fields(
+        text_fields,
+        IDIC_INNOVATION_MANAGEMENT_STRONG_SIGNALS,
+    )
+    transformation_present = contains_any_phrase_in_text_fields(
+        text_fields,
+        IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS,
+    )
+
+    if linea == "Transformación organizacional" and innovation_present and not transformation_present:
+        return False
+
+    return True
+
+
+def apply_idic_line_bonus(linea: str, text_fields: dict[str, str], base_score: int) -> int:
+    title_text = text_fields.get("title")
+    abstract_text = text_fields.get("abstract")
+    keyword_text = " | ".join(
+        [
+            text_fields.get("author_keywords", ""),
+            text_fields.get("index_keywords", ""),
+        ]
+    )
+
+    if linea == "Gestión de la innovación":
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, IDIC_INNOVATION_MANAGEMENT_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, IDIC_INNOVATION_MANAGEMENT_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_INNOVATION_MANAGEMENT_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Transformación organizacional":
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS)
+        return base_score + bonus
+
+    return base_score
+
+
+def choose_best_idic_line_with_rules(
+    score_map: dict[str, int],
+    text_fields: dict[str, str],
+    min_score: int,
+    min_margin: int = 1,
+    relaxed: bool = False,
+) -> str | None:
+    filtered: list[tuple[str, int]] = []
+
+    for linea, score in score_map.items():
+        if score < min_score:
+            continue
+        if not is_idic_line_eligible_by_domain_rules(linea, text_fields):
+            continue
+        adjusted_score = apply_idic_line_bonus(linea, text_fields, score)
+        filtered.append((linea, adjusted_score))
+
+    if not filtered:
+        return None
+
+    filtered.sort(key=lambda x: (-x[1], normalize_generic_text(x[0])))
+
+    if relaxed:
+        return filtered[0][0]
+
+    best_linea, best_score = filtered[0]
+    tied = [linea for linea, score in filtered if score == best_score]
+    if len(tied) > 1:
+        return None
+
+    if len(filtered) > 1:
+        second_score = filtered[1][1]
+        if (best_score - second_score) < min_margin:
+            return None
+
+    return best_linea
+
+
+def apply_final_idic_guardrails(
+    category_tematica: str | None,
+    area_idic: str | None,
+    linea_idic: str | None,
+    text_fields: dict[str, str],
+) -> tuple[str | None, str | None, str | None, str | None]:
+    if not category_tematica or not area_idic or not linea_idic:
+        return category_tematica, area_idic, linea_idic, None
+
+    innovation_present = contains_any_phrase_in_text_fields(
+        text_fields,
+        IDIC_INNOVATION_MANAGEMENT_STRONG_SIGNALS,
+    )
+    transformation_present = contains_any_phrase_in_text_fields(
+        text_fields,
+        IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS,
+    )
+
+    if (
+        category_tematica == "Gestión y economía del conocimiento"
+        and area_idic == "Innovación empresarial"
+        and linea_idic == "Transformación organizacional"
+        and innovation_present
+        and not transformation_present
+    ):
+        return (
+            category_tematica,
+            area_idic,
+            "Gestión de la innovación",
+            "idic_guardrail_innovation_over_transformation",
+        )
+
+    return category_tematica, area_idic, linea_idic, None
 
 
 def append_classification_source(result: dict, source_name: str) -> None:
@@ -1775,10 +1924,12 @@ def classify_idic_dimensions_by_hints(
                     support_aliases=support_aliases,
                 )
 
-    best_linea = choose_best_scored_candidate_with_margin(
-        line_scores,
+    best_linea = choose_best_idic_line_with_rules(
+        score_map=line_scores,
+        text_fields=text_fields,
         min_score=THEMATIC_STRICT_MIN_SCORE,
         min_margin=THEMATIC_STRICT_MIN_MARGIN,
+        relaxed=False,
     )
     best_area = coerce_area_idic_from_linea(best_linea) if best_linea else None
     best_category = coerce_category_tematica_from_area(best_area) if best_area else None
@@ -1831,9 +1982,12 @@ def classify_idic_dimensions_by_hints_approx(
                     support_aliases=support_aliases,
                 )
 
-    best_linea = choose_best_scored_candidate_relaxed(
-        line_scores,
+    best_linea = choose_best_idic_line_with_rules(
+        score_map=line_scores,
+        text_fields=text_fields,
         min_score=THEMATIC_APPROX_MIN_SCORE,
+        min_margin=1,
+        relaxed=True,
     )
     best_area = coerce_area_idic_from_linea(best_linea) if best_linea else None
     best_category = coerce_category_tematica_from_area(best_area) if best_area else None
@@ -1996,6 +2150,8 @@ def build_idic_classification_prompt(
         "Debes elegir solo valores existentes en el catálogo proporcionado.",
         "No inventes categorías, áreas ni líneas.",
         "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
+        "Dentro de 'Gestión y economía del conocimiento' > 'Innovación empresarial', favorece 'Gestión de la innovación' cuando el foco sea 5S, standard work, lean, mejora continua, mejora de procesos, eficiencia operativa o productividad.",
+        "Dentro de 'Gestión y economía del conocimiento' > 'Innovación empresarial', usa 'Transformación organizacional' solo cuando el aporte central trate explícitamente de transformación, rediseño o cambio organizacional.",
         "Distingue claramente entre enfoques de tecnología digital, sostenibilidad y comportamiento humano según el aporte central del artículo.",
         "Evita decidir solo por palabras amplias si el título y el resumen apuntan a un tema más específico.",
     ]
@@ -2334,6 +2490,29 @@ def classify_thematic_fields(
         merged = merge_non_null_fields(merged, idic_hint_approx, idic_fields)
         if any(idic_hint_approx.get(field) for field in idic_fields):
             append_classification_source(merged, "idic_hints_approx")
+
+    text_fields = build_thematic_text_fields(
+        title_value,
+        abstract_value,
+        author_keywords_value,
+        index_keywords_value,
+        source_title_value,
+    )
+
+    (
+        merged["category_tematica_raw"],
+        merged["area_idic_raw"],
+        merged["linea_idic_raw"],
+        idic_guardrail_source,
+    ) = apply_final_idic_guardrails(
+        merged.get("category_tematica_raw"),
+        merged.get("area_idic_raw"),
+        merged.get("linea_idic_raw"),
+        text_fields,
+    )
+
+    if idic_guardrail_source:
+        append_classification_source(merged, idic_guardrail_source)
 
     # Validación final
     if not is_valid_career_area_line(

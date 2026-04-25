@@ -206,6 +206,15 @@ def choose_best_scored_candidate(score_map: dict[str, int], min_score: int = 1) 
     return best_key
 
 
+def choose_best_scored_candidate_relaxed(score_map: dict[str, int], min_score: int = 1) -> str | None:
+    positives = [(k, v) for k, v in score_map.items() if v >= min_score]
+    if not positives:
+        return None
+
+    positives.sort(key=lambda x: (-x[1], normalize_generic_text(x[0])))
+    return positives[0][0]
+
+
 def clip_text(value: str | None, max_chars: int = 7000) -> str | None:
     if not value:
         return None
@@ -271,6 +280,29 @@ def merge_non_null_fields(base: dict, filler: dict, fields: list[str]) -> dict:
         if not result.get(field) and filler.get(field):
             result[field] = filler[field]
     return result
+
+
+def has_any_thematic_field(payload: dict) -> bool:
+    return any(
+        [
+            payload.get("area_carrera_raw"),
+            payload.get("linea_carrera_raw"),
+            payload.get("category_tematica_raw"),
+            payload.get("area_idic_raw"),
+            payload.get("linea_idic_raw"),
+        ]
+    )
+
+
+def missing_thematic_fields(payload: dict) -> list[str]:
+    fields = [
+        "area_carrera_raw",
+        "linea_carrera_raw",
+        "category_tematica_raw",
+        "area_idic_raw",
+        "linea_idic_raw",
+    ]
+    return [f for f in fields if not payload.get(f)]
 
 
 # =========================
@@ -644,141 +676,624 @@ def is_valid_idic_triplet(
 # =========================
 CAREER_LINE_HINTS = {
     "Ingeniería Industrial": {
-        "Diseño de sistemas de trabajo": ["diseno de sistemas de trabajo", "work design", "work system design"],
-        "Evaluación de factores físicos": ["factores fisicos", "physical factors"],
-        "Evaluación ergonómica": ["ergonomia", "ergonomic", "ergonomics"],
+        "Diseño de sistemas de trabajo": [
+            "diseno de sistemas de trabajo",
+            "work design",
+            "work system design",
+        ],
+        "Evaluación de factores físicos": [
+            "factores fisicos",
+            "physical factors",
+        ],
+        "Evaluación ergonómica": [
+            "ergonomia",
+            "ergonomic",
+            "ergonomics",
+        ],
         "Modelamiento matemático a la mejora de procesos como soporte a la toma de decisiones": [
-            "modelamiento matematico", "mathematical modeling", "decision making"
+            "modelamiento matematico",
+            "mathematical modeling",
+            "decision making",
         ],
-        "Simulación para la mejora del diseño de procesos": ["simulacion", "simulation", "process simulation"],
+        "Simulación para la mejora del diseño de procesos": [
+            "simulacion",
+            "simulation",
+            "process simulation",
+        ],
         "Diseño y desarrollo de modelos para el análisis y predicción de las variables de un proceso": [
-            "prediccion", "prediction", "forecasting", "analisis de variables"
+            "prediccion",
+            "prediction",
+            "forecasting",
+            "analisis de variables",
+            "benchmarking",
+            "multi model",
+            "multi-model",
+            "cross validation",
+            "cross-validation",
+            "particle swarm optimization",
+            "pso",
+            "machine learning",
         ],
-        "Planeamiento y Gestión de Operaciones": ["operations management", "gestion de operaciones", "planeamiento de operaciones"],
-        "Planeamiento, programación y control de proyectos": ["project scheduling", "project control", "programacion y control de proyectos"],
-        "Gestión de mantenimiento": ["mantenimiento", "maintenance management"],
-        "Gestión de la cadena de suministro": ["supply chain", "cadena de suministro"],
-        "Gestión de Logística Inversa": ["logistica inversa", "reverse logistics"],
-        "Gestión de Inventarios, Almacenes y Transportes": ["inventarios", "almacenes", "transportes", "inventory", "warehouse", "transportation"],
+        "Planeamiento y Gestión de Operaciones": [
+            "operations management",
+            "gestion de operaciones",
+            "planeamiento de operaciones",
+            "operational efficiency",
+            "process improvement",
+            "lean",
+            "5s",
+            "standard work",
+            "otif",
+            "productivity improvement",
+        ],
+        "Planeamiento, programación y control de proyectos": [
+            "project scheduling",
+            "project control",
+            "programacion y control de proyectos",
+        ],
+        "Gestión de mantenimiento": [
+            "mantenimiento",
+            "maintenance management",
+        ],
+        "Gestión de la cadena de suministro": [
+            "supply chain",
+            "cadena de suministro",
+        ],
+        "Gestión de Logística Inversa": [
+            "logistica inversa",
+            "reverse logistics",
+        ],
+        "Gestión de Inventarios, Almacenes y Transportes": [
+            "inventarios",
+            "almacenes",
+            "transportes",
+            "inventory",
+            "warehouse",
+            "transportation",
+            "inventory management",
+            "warehouse management",
+            "storage center",
+            "packing process",
+            "otif",
+        ],
         "Gestión de compras y proveedores, Nivel de servicio y Satisfacción al cliente": [
-            "compras", "proveedores", "nivel de servicio", "satisfaccion al cliente", "supplier", "service level"
+            "compras",
+            "proveedores",
+            "nivel de servicio",
+            "satisfaccion al cliente",
+            "supplier",
+            "service level",
         ],
-        "Gestión de riesgos ocupacionales": ["riesgos ocupacionales", "occupational risks"],
+        "Gestión de riesgos ocupacionales": [
+            "riesgos ocupacionales",
+            "occupational risks",
+        ],
         "Identificación, análisis, evaluación y control de riesgos en seguridad y salud ocupacional": [
-            "seguridad y salud ocupacional", "occupational health", "occupational safety"
+            "seguridad y salud ocupacional",
+            "occupational health",
+            "occupational safety",
         ],
-        "Diseño de producto": ["diseno de producto", "product design"],
-        "Desarrollo de producto": ["desarrollo de producto", "product development"],
+        "Diseño de producto": [
+            "diseno de producto",
+            "product design",
+        ],
+        "Desarrollo de producto": [
+            "desarrollo de producto",
+            "product development",
+            "nanoparticles",
+            "silver nanoparticles",
+            "green synthesis",
+            "antimicrobial applications",
+        ],
     },
     "Ingeniería Civil": {
-        "Ecuaciones diferenciales aplicadas al análisis estructural": ["analisis estructural", "structural analysis", "ecuaciones diferenciales"],
-        "Física de materiales": ["fisica de materiales", "materials physics"],
-        "Metodología BIM": ["bim", "building information modeling"],
-        "Normativa BIM": ["normativa bim", "bim standard", "bim standards"],
-        "Materiales de Construcción": ["materiales de construccion", "construction materials"],
-        "Sostenibilidad": ["sostenibilidad", "sustainability"],
-        "Innovación en Proceso constructivos": ["proceso constructivo", "construction process innovation"],
-        "Tecnología": ["tecnologia en construccion", "construction technology"],
-        "Técnicas de experimentación en estructuras": ["experimental structures", "experimentacion en estructuras"],
-        "Vulnerabilidad sísmica de estructuras": ["vulnerabilidad sismica", "seismic vulnerability"],
-        "Sistemas de protección sísmica de estructuras": ["proteccion sismica", "seismic protection", "base isolation"],
-        "Obras de Construcción y su relación con el medio ambiente": ["medio ambiente", "environmental impact", "construction and environment"],
-        "Hidrología e Hidráulica": ["hidrologia", "hidraulica", "hydrology", "hydraulics"],
-        "Riego y Drenaje": ["riego", "drenaje", "irrigation", "drainage"],
-        "Calidad del Agua": ["calidad del agua", "water quality"],
-        "Cambio Climático en Recursos Hídricos": ["cambio climatico", "climate change", "recursos hidricos", "water resources"],
-        "Transporte de Sedimentos": ["sedimentos", "sediment transport"],
-        "Hidrogeología": ["hidrogeologia", "hydrogeology"],
-        "Geotecnia computacional": ["geotecnia computacional", "computational geotechnics"],
-        "Geotecnia ambiental e hidrogeología": ["geotecnia ambiental", "environmental geotechnics"],
-        "Geotecnia experimental": ["geotecnia experimental", "experimental geotechnics"],
-        "Geotecnia minera": ["geotecnia minera", "mining geotechnics"],
-        "Mecánica de rocas e ingeniería geológica": ["mecanica de rocas", "rock mechanics", "ingenieria geologica"],
-        "Tecnologia de mezclas asfalticas": ["mezclas asfalticas", "asphalt mixtures"],
-        "Diseño estructural de Pavimentos": ["pavimentos", "pavement design"],
-        "Mejora y estabilización del suelo": ["estabilizacion del suelo", "soil stabilization", "mejora del suelo"],
-        "Cambio climatico en la infraestructura vial": ["infraestructura vial", "road infrastructure", "climate change in transport infrastructure"],
-        "Gestion de riesgos geológicos": ["riesgos geologicos", "geological risks"],
-        "Gestión de riesgos": ["gestion de riesgos", "risk management"],
-        "Gestión estratégica de contratos": ["contratos", "contract management"],
-        "Gestión de las comunicaciones": ["communications management", "gestion de las comunicaciones"],
-        "Gestión de recursos": ["resource management", "gestion de recursos"],
+        "Ecuaciones diferenciales aplicadas al análisis estructural": [
+            "analisis estructural",
+            "structural analysis",
+            "ecuaciones diferenciales",
+        ],
+        "Física de materiales": [
+            "fisica de materiales",
+            "materials physics",
+        ],
+        "Metodología BIM": [
+            "bim",
+            "building information modeling",
+        ],
+        "Normativa BIM": [
+            "normativa bim",
+            "bim standard",
+            "bim standards",
+        ],
+        "Materiales de Construcción": [
+            "materiales de construccion",
+            "construction materials",
+        ],
+        "Sostenibilidad": [
+            "sostenibilidad",
+            "sustainability",
+        ],
+        "Innovación en Proceso constructivos": [
+            "proceso constructivo",
+            "construction process innovation",
+        ],
+        "Tecnología": [
+            "tecnologia en construccion",
+            "construction technology",
+        ],
+        "Técnicas de experimentación en estructuras": [
+            "experimental structures",
+            "experimentacion en estructuras",
+        ],
+        "Vulnerabilidad sísmica de estructuras": [
+            "vulnerabilidad sismica",
+            "seismic vulnerability",
+        ],
+        "Sistemas de protección sísmica de estructuras": [
+            "proteccion sismica",
+            "seismic protection",
+            "base isolation",
+        ],
+        "Obras de Construcción y su relación con el medio ambiente": [
+            "medio ambiente",
+            "environmental impact",
+            "construction and environment",
+        ],
+        "Hidrología e Hidráulica": [
+            "hidrologia",
+            "hidraulica",
+            "hydrology",
+            "hydraulics",
+        ],
+        "Riego y Drenaje": [
+            "riego",
+            "drenaje",
+            "irrigation",
+            "drainage",
+        ],
+        "Calidad del Agua": [
+            "calidad del agua",
+            "water quality",
+        ],
+        "Cambio Climático en Recursos Hídricos": [
+            "cambio climatico",
+            "climate change",
+            "recursos hidricos",
+            "water resources",
+        ],
+        "Transporte de Sedimentos": [
+            "sedimentos",
+            "sediment transport",
+        ],
+        "Hidrogeología": [
+            "hidrogeologia",
+            "hydrogeology",
+        ],
+        "Geotecnia computacional": [
+            "geotecnia computacional",
+            "computational geotechnics",
+        ],
+        "Geotecnia ambiental e hidrogeología": [
+            "geotecnia ambiental",
+            "environmental geotechnics",
+        ],
+        "Geotecnia experimental": [
+            "geotecnia experimental",
+            "experimental geotechnics",
+        ],
+        "Geotecnia minera": [
+            "geotecnia minera",
+            "mining geotechnics",
+        ],
+        "Mecánica de rocas e ingeniería geológica": [
+            "mecanica de rocas",
+            "rock mechanics",
+            "ingenieria geologica",
+        ],
+        "Tecnologia de mezclas asfalticas": [
+            "mezclas asfalticas",
+            "asphalt mixtures",
+        ],
+        "Diseño estructural de Pavimentos": [
+            "pavimentos",
+            "pavement design",
+        ],
+        "Mejora y estabilización del suelo": [
+            "estabilizacion del suelo",
+            "soil stabilization",
+            "mejora del suelo",
+        ],
+        "Cambio climatico en la infraestructura vial": [
+            "infraestructura vial",
+            "road infrastructure",
+            "climate change in transport infrastructure",
+        ],
+        "Gestion de riesgos geológicos": [
+            "riesgos geologicos",
+            "geological risks",
+        ],
+        "Gestión de riesgos": [
+            "gestion de riesgos",
+            "risk management",
+        ],
+        "Gestión estratégica de contratos": [
+            "contratos",
+            "contract management",
+        ],
+        "Gestión de las comunicaciones": [
+            "communications management",
+            "gestion de las comunicaciones",
+        ],
+        "Gestión de recursos": [
+            "resource management",
+            "gestion de recursos",
+        ],
     },
     "Ingeniería de Sistemas": {
-        "Visión computacional": ["vision computacional", "computer vision"],
-        "NLP": ["nlp", "natural language processing", "procesamiento de lenguaje natural"],
-        "Aprendizaje automático": ["aprendizaje automatico", "machine learning"],
-        "Minería de datos": ["mineria de datos", "data mining"],
-        "Seguridad de sistemas y aplicaciones": ["seguridad de sistemas", "application security", "systems security"],
-        "IoT": ["iot", "internet of things"],
-        "Computación de alto rendimiento": ["high performance computing", "computacion de alto rendimiento", "hpc"],
-        "Redes y ciberseguridad": ["ciberseguridad", "cybersecurity", "networks", "redes"],
-        "Sostenibilidad en TI": ["sostenibilidad en ti", "green it"],
-        "HCI": ["hci", "human computer interaction", "interaccion humano computadora"],
-        "Realidad virtual y aumentada": ["realidad virtual", "realidad aumentada", "virtual reality", "augmented reality"],
-        "Construcción de juegos y gamificación": ["gamification", "gamificacion", "game development", "juegos"],
-        "Agentes virtuales": ["virtual agents", "agentes virtuales", "chatbot", "chatbots"],
-        "Optimización computacional": ["optimizacion computacional", "computational optimization"],
-        "Ingeniería de software": ["ingenieria de software", "software engineering"],
-        "Diseño de algoritmos": ["diseno de algoritmos", "algorithm design"],
-        "Gestión de procesos tecnológicos": ["procesos tecnologicos", "technology process management"],
-        "Liderazgo, género y tecnología": ["genero y tecnologia", "gender and technology", "liderazgo y tecnologia"],
-        "Sistemas de gestión del conocimiento": ["gestion del conocimiento", "knowledge management systems"],
-        "Minería de procesos": ["mineria de procesos", "process mining"],
-        "Computación aplicada": ["computacion aplicada", "applied computing"],
-        "Simulación de procesos": ["simulacion de procesos", "process simulation"],
+        "Visión computacional": [
+            "vision computacional",
+            "computer vision",
+        ],
+        "NLP": [
+            "nlp",
+            "natural language processing",
+            "procesamiento de lenguaje natural",
+        ],
+        "Aprendizaje automático": [
+            "aprendizaje automatico",
+            "machine learning",
+        ],
+        "Minería de datos": [
+            "mineria de datos",
+            "data mining",
+        ],
+        "Seguridad de sistemas y aplicaciones": [
+            "seguridad de sistemas",
+            "application security",
+            "systems security",
+        ],
+        "IoT": [
+            "iot",
+            "internet of things",
+        ],
+        "Computación de alto rendimiento": [
+            "high performance computing",
+            "computacion de alto rendimiento",
+            "hpc",
+        ],
+        "Redes y ciberseguridad": [
+            "ciberseguridad",
+            "cybersecurity",
+            "networks",
+            "redes",
+        ],
+        "Sostenibilidad en TI": [
+            "sostenibilidad en ti",
+            "green it",
+        ],
+        "HCI": [
+            "hci",
+            "human computer interaction",
+            "interaccion humano computadora",
+        ],
+        "Realidad virtual y aumentada": [
+            "realidad virtual",
+            "realidad aumentada",
+            "virtual reality",
+            "augmented reality",
+        ],
+        "Construcción de juegos y gamificación": [
+            "gamification",
+            "gamificacion",
+            "game development",
+            "juegos",
+        ],
+        "Agentes virtuales": [
+            "virtual agents",
+            "agentes virtuales",
+            "chatbot",
+            "chatbots",
+        ],
+        "Optimización computacional": [
+            "optimizacion computacional",
+            "computational optimization",
+        ],
+        "Ingeniería de software": [
+            "ingenieria de software",
+            "software engineering",
+        ],
+        "Diseño de algoritmos": [
+            "diseno de algoritmos",
+            "algorithm design",
+        ],
+        "Gestión de procesos tecnológicos": [
+            "procesos tecnologicos",
+            "technology process management",
+        ],
+        "Liderazgo, género y tecnología": [
+            "genero y tecnologia",
+            "gender and technology",
+            "liderazgo y tecnologia",
+            "women in stem",
+            "stem leadership",
+            "gender gap",
+        ],
+        "Sistemas de gestión del conocimiento": [
+            "gestion del conocimiento",
+            "knowledge management systems",
+        ],
+        "Minería de procesos": [
+            "mineria de procesos",
+            "process mining",
+        ],
+        "Computación aplicada": [
+            "computacion aplicada",
+            "applied computing",
+        ],
+        "Simulación de procesos": [
+            "simulacion de procesos",
+            "process simulation",
+        ],
     },
 }
 
 IDIC_LINE_HINTS = {
-    "Machine learning y deep learning": ["machine learning", "deep learning", "aprendizaje automatico"],
-    "Procesamiento de lenguaje natural": ["natural language processing", "procesamiento de lenguaje natural", "nlp"],
-    "Visión computacional": ["computer vision", "vision computacional"],
-    "Sistemas autónomos y robótica": ["robotica", "robotics", "autonomous systems"],
-    "Tecnologías emergentes": ["tecnologias emergentes", "emerging technologies"],
-    "Ciberseguridad y privacidad": ["ciberseguridad", "cybersecurity", "privacy", "privacidad"],
-    "Internet de las cosas (IoT)": ["internet of things", "iot"],
-    "Computación cuántica": ["computacion cuantica", "quantum computing"],
-    "Diseño y construcción virtual": ["construccion virtual", "virtual construction", "bim"],
-    "Interacción humano-computadora": ["human computer interaction", "interaccion humano computadora", "hci"],
-    "Realidad virtual y aumentada": ["virtual reality", "augmented reality", "realidad virtual", "realidad aumentada"],
-    "Diseño de interfaces adaptativas": ["adaptive interfaces", "interfaces adaptativas"],
-    "Energías renovables": ["energias renovables", "renewable energy"],
-    "Economía circular": ["economia circular", "circular economy"],
-    "Gestión sostenible de recursos": ["gestion sostenible de recursos", "sustainable resource management"],
-    "Adaptación al cambio climático": ["adaptacion al cambio climatico", "climate adaptation"],
-    "Urbanismo sostenible": ["urbanismo sostenible", "sustainable urbanism"],
-    "Movilidad urbana": ["movilidad urbana", "urban mobility"],
-    "Infraestructura sostenible": ["infraestructura sostenible", "sustainable infrastructure"],
-    "Gestión inteligente de recursos": ["smart resource management", "gestion inteligente de recursos"],
-    "Tecnologías limpias": ["tecnologias limpias", "clean technologies"],
-    "Biodiversidad y conservación": ["biodiversidad", "conservacion", "biodiversity", "conservation"],
-    "Gestión de residuos": ["gestion de residuos", "waste management"],
-    "Materiales avanzados": ["materiales avanzados", "advanced materials"],
-    "Salud mental y bienestar": ["salud mental", "mental health", "wellbeing", "bienestar"],
-    "Educación, desarrollo cognitivo y socioafectivo": ["educacion", "education", "desarrollo cognitivo", "socioafectivo"],
-    "Comportamiento social": ["comportamiento social", "social behavior"],
-    "Mujer, cultura y sociedad": ["mujer", "woman", "women", "culture and society", "cultura y sociedad"],
-    "Pobreza e informalidad": ["pobreza", "poverty", "informalidad", "informality"],
-    "Medios digitales y sociedad": ["medios digitales", "digital media", "society"],
-    "Comunicación intercultural": ["comunicacion intercultural", "intercultural communication"],
-    "Narrativas transmedia": ["narrativas transmedia", "transmedia narratives"],
-    "Comportamiento digital": ["comportamiento digital", "digital behavior"],
-    "Ética y gobernanza": ["etica", "ethics", "governance", "gobernanza"],
-    "Responsabilidad social": ["responsabilidad social", "social responsibility"],
-    "Derechos humanos y tecnología": ["derechos humanos", "human rights", "technology"],
-    "Modelos de negocio digitales": ["modelos de negocio digitales", "digital business models"],
-    "Emprendimiento tecnológico": ["emprendimiento tecnologico", "technology entrepreneurship"],
-    "Gestión de la innovación": ["gestion de la innovacion", "innovation management"],
-    "Transformación organizacional": ["transformacion organizacional", "organizational transformation"],
-    "Fintech y servicios financieros": ["fintech", "financial services", "servicios financieros"],
-    "Mercados globales": ["mercados globales", "global markets"],
-    "Análisis de datos económicos": ["analisis de datos economicos", "economic data analysis"],
-    "Economía de plataformas": ["economia de plataformas", "platform economy"],
-    "Gestión del capital intelectual": ["capital intelectual", "intellectual capital"],
-    "Aprendizaje organizacional": ["aprendizaje organizacional", "organizational learning"],
-    "Transferencia de conocimiento": ["transferencia de conocimiento", "knowledge transfer"],
-    "Inteligencia de negocios": ["inteligencia de negocios", "business intelligence"],
+    "Machine learning y deep learning": [
+        "machine learning",
+        "deep learning",
+        "aprendizaje automatico",
+    ],
+    "Procesamiento de lenguaje natural": [
+        "natural language processing",
+        "procesamiento de lenguaje natural",
+        "nlp",
+    ],
+    "Visión computacional": [
+        "computer vision",
+        "vision computacional",
+    ],
+    "Sistemas autónomos y robótica": [
+        "robotica",
+        "robotics",
+        "autonomous systems",
+    ],
+    "Tecnologías emergentes": [
+        "tecnologias emergentes",
+        "emerging technologies",
+    ],
+    "Ciberseguridad y privacidad": [
+        "ciberseguridad",
+        "cybersecurity",
+        "privacy",
+        "privacidad",
+    ],
+    "Internet de las cosas (IoT)": [
+        "internet of things",
+        "iot",
+    ],
+    "Computación cuántica": [
+        "computacion cuantica",
+        "quantum computing",
+    ],
+    "Diseño y construcción virtual": [
+        "construccion virtual",
+        "virtual construction",
+        "bim",
+    ],
+    "Interacción humano-computadora": [
+        "human computer interaction",
+        "interaccion humano computadora",
+        "hci",
+    ],
+    "Realidad virtual y aumentada": [
+        "virtual reality",
+        "augmented reality",
+        "realidad virtual",
+        "realidad aumentada",
+    ],
+    "Diseño de interfaces adaptativas": [
+        "adaptive interfaces",
+        "interfaces adaptativas",
+    ],
+    "Energías renovables": [
+        "energias renovables",
+        "renewable energy",
+    ],
+    "Economía circular": [
+        "economia circular",
+        "circular economy",
+        "valorization",
+        "waste valorization",
+        "recycling",
+        "reuse",
+    ],
+    "Gestión sostenible de recursos": [
+        "gestion sostenible de recursos",
+        "sustainable resource management",
+        "resource optimization",
+        "inventory management",
+        "warehouse management",
+        "storage center",
+    ],
+    "Adaptación al cambio climático": [
+        "adaptacion al cambio climatico",
+        "climate adaptation",
+    ],
+    "Urbanismo sostenible": [
+        "urbanismo sostenible",
+        "sustainable urbanism",
+    ],
+    "Movilidad urbana": [
+        "movilidad urbana",
+        "urban mobility",
+    ],
+    "Infraestructura sostenible": [
+        "infraestructura sostenible",
+        "sustainable infrastructure",
+    ],
+    "Gestión inteligente de recursos": [
+        "smart resource management",
+        "gestion inteligente de recursos",
+        "inventory management",
+        "resource allocation",
+        "storage center",
+        "warehouse",
+        "inventory",
+    ],
+    "Tecnologías limpias": [
+        "tecnologias limpias",
+        "clean technologies",
+        "green synthesis",
+        "eco friendly",
+        "eco-friendly",
+        "sustainable valorization",
+        "clean technology",
+    ],
+    "Biodiversidad y conservación": [
+        "biodiversidad",
+        "conservacion",
+        "biodiversity",
+        "conservation",
+    ],
+    "Gestión de residuos": [
+        "gestion de residuos",
+        "waste management",
+        "waste",
+        "paper industry waste",
+        "agro-industrial waste",
+        "sludge",
+        "residuos",
+    ],
+    "Materiales avanzados": [
+        "materiales avanzados",
+        "advanced materials",
+        "nanoparticles",
+        "silver nanoparticles",
+    ],
+    "Salud mental y bienestar": [
+        "salud mental",
+        "mental health",
+        "wellbeing",
+        "bienestar",
+    ],
+    "Educación, desarrollo cognitivo y socioafectivo": [
+        "educacion",
+        "education",
+        "desarrollo cognitivo",
+        "socioafectivo",
+    ],
+    "Comportamiento social": [
+        "comportamiento social",
+        "social behavior",
+    ],
+    "Mujer, cultura y sociedad": [
+        "mujer",
+        "woman",
+        "women",
+        "culture and society",
+        "cultura y sociedad",
+        "women in stem",
+        "gender gap",
+        "leadership in stem",
+    ],
+    "Pobreza e informalidad": [
+        "pobreza",
+        "poverty",
+        "informalidad",
+        "informality",
+    ],
+    "Medios digitales y sociedad": [
+        "medios digitales",
+        "digital media",
+        "society",
+    ],
+    "Comunicación intercultural": [
+        "comunicacion intercultural",
+        "intercultural communication",
+    ],
+    "Narrativas transmedia": [
+        "narrativas transmedia",
+        "transmedia narratives",
+    ],
+    "Comportamiento digital": [
+        "comportamiento digital",
+        "digital behavior",
+    ],
+    "Ética y gobernanza": [
+        "etica",
+        "ethics",
+        "governance",
+        "gobernanza",
+    ],
+    "Responsabilidad social": [
+        "responsabilidad social",
+        "social responsibility",
+    ],
+    "Derechos humanos y tecnología": [
+        "derechos humanos",
+        "human rights",
+        "technology",
+    ],
+    "Modelos de negocio digitales": [
+        "modelos de negocio digitales",
+        "digital business models",
+    ],
+    "Emprendimiento tecnológico": [
+        "emprendimiento tecnologico",
+        "technology entrepreneurship",
+    ],
+    "Gestión de la innovación": [
+        "gestion de la innovacion",
+        "innovation management",
+        "improvement model",
+        "continuous improvement",
+        "process improvement",
+        "5s",
+        "standard work",
+        "operational efficiency",
+        "productivity improvement",
+        "otif",
+    ],
+    "Transformación organizacional": [
+        "transformacion organizacional",
+        "organizational transformation",
+        "organizational improvement",
+        "process redesign",
+        "workflow redesign",
+    ],
+    "Fintech y servicios financieros": [
+        "fintech",
+        "financial services",
+        "servicios financieros",
+    ],
+    "Mercados globales": [
+        "mercados globales",
+        "global markets",
+    ],
+    "Análisis de datos económicos": [
+        "analisis de datos economicos",
+        "economic data analysis",
+    ],
+    "Economía de plataformas": [
+        "economia de plataformas",
+        "platform economy",
+    ],
+    "Gestión del capital intelectual": [
+        "capital intelectual",
+        "intellectual capital",
+    ],
+    "Aprendizaje organizacional": [
+        "aprendizaje organizacional",
+        "organizational learning",
+    ],
+    "Transferencia de conocimiento": [
+        "transferencia de conocimiento",
+        "knowledge transfer",
+    ],
+    "Inteligencia de negocios": [
+        "inteligencia de negocios",
+        "business intelligence",
+    ],
 }
 
 
@@ -824,6 +1339,40 @@ def classify_career_dimensions_by_hints(
     return {"area_carrera_raw": best_area, "linea_carrera_raw": best_linea}
 
 
+def classify_career_dimensions_by_hints_approx(
+    carrera: str | None,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> dict:
+    if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
+        return {"area_carrera_raw": None, "linea_carrera_raw": None}
+
+    corpus = build_text_corpus(
+        title_value,
+        abstract_value,
+        author_keywords_value,
+        index_keywords_value,
+        source_title_value,
+    )
+    if not corpus:
+        return {"area_carrera_raw": None, "linea_carrera_raw": None}
+
+    line_scores: dict[str, int] = {}
+    for area_name, lineas in CAREER_AREA_LINE_CATALOG[carrera].items():
+        for linea in lineas:
+            aliases = [linea, area_name]
+            aliases.extend(CAREER_LINE_HINTS.get(carrera, {}).get(linea, []))
+            line_scores[linea] = build_classification_score(corpus, aliases)
+
+    best_linea = choose_best_scored_candidate_relaxed(line_scores, min_score=1)
+    best_area = coerce_area_carrera_from_linea(carrera, best_linea) if best_linea else None
+
+    return {"area_carrera_raw": best_area, "linea_carrera_raw": best_linea}
+
+
 def classify_idic_dimensions_by_hints(
     title_value: str | None,
     abstract_value: str | None,
@@ -854,6 +1403,52 @@ def classify_idic_dimensions_by_hints(
                 line_scores[linea] = build_classification_score(corpus, aliases)
 
     best_linea = choose_best_scored_candidate(line_scores, min_score=1)
+    best_area = coerce_area_idic_from_linea(best_linea) if best_linea else None
+    best_category = coerce_category_tematica_from_area(best_area) if best_area else None
+
+    if best_category and best_area and best_linea:
+        if not is_valid_idic_triplet(best_category, best_area, best_linea):
+            best_category = None
+            best_area = None
+            best_linea = None
+
+    return {
+        "category_tematica_raw": best_category,
+        "area_idic_raw": best_area,
+        "linea_idic_raw": best_linea,
+    }
+
+
+def classify_idic_dimensions_by_hints_approx(
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> dict:
+    corpus = build_text_corpus(
+        title_value,
+        abstract_value,
+        author_keywords_value,
+        index_keywords_value,
+        source_title_value,
+    )
+    if not corpus:
+        return {
+            "category_tematica_raw": None,
+            "area_idic_raw": None,
+            "linea_idic_raw": None,
+        }
+
+    line_scores: dict[str, int] = {}
+    for category_name, areas in IDIC_CATEGORY_AREA_LINE_CATALOG.items():
+        for area_name, lineas in areas.items():
+            for linea in lineas:
+                aliases = [linea, area_name, category_name]
+                aliases.extend(IDIC_LINE_HINTS.get(linea, []))
+                line_scores[linea] = build_classification_score(corpus, aliases)
+
+    best_linea = choose_best_scored_candidate_relaxed(line_scores, min_score=1)
     best_area = coerce_area_idic_from_linea(best_linea) if best_linea else None
     best_category = coerce_category_tematica_from_area(best_area) if best_area else None
 
@@ -963,7 +1558,7 @@ def build_thematic_classification_prompt(
             "No inventes áreas, líneas o categorías.",
             "Primero intenta una clasificación exacta.",
             "Si no hay evidencia suficiente para exactitud total, elige la opción más próxima semánticamente dentro del catálogo.",
-            "Prioriza no dejar campos vacíos cuando exista una aproximación razonable y defendible.",
+            "Para artículos de ingeniería, prioriza no dejar campos vacíos cuando exista una aproximación razonable y defendible.",
             "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
             "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
             "Si realmente no hay base razonable, devuelve null.",
@@ -1127,6 +1722,7 @@ def classify_thematic_fields(
     index_keywords_value: str | None,
     source_title_value: str | None,
 ) -> dict:
+    merged = build_thematic_empty_result()
     fields_to_fill = [
         "area_carrera_raw",
         "linea_carrera_raw",
@@ -1135,6 +1731,7 @@ def classify_thematic_fields(
         "linea_idic_raw",
     ]
 
+    # 1) LLM strict
     strict_result = classify_thematic_fields_with_llm(
         carrera=carrera,
         title_value=title_value,
@@ -1144,12 +1741,16 @@ def classify_thematic_fields(
         source_title_value=source_title_value,
         mode="strict",
     )
+    merged = merge_non_null_fields(merged, strict_result, fields_to_fill)
+    if strict_result.get("confidence") is not None:
+        merged["confidence"] = strict_result.get("confidence")
+    if strict_result.get("justification"):
+        merged["justification"] = strict_result.get("justification")
+    if strict_result.get("classification_mode"):
+        merged["classification_mode"] = strict_result.get("classification_mode")
 
-    merged = dict(strict_result)
-
-    needs_approx = any(not merged.get(field) for field in fields_to_fill)
-
-    if needs_approx:
+    # 2) LLM approx only for missing fields
+    if missing_thematic_fields(merged):
         approx_result = classify_thematic_fields_with_llm(
             carrera=carrera,
             title_value=title_value,
@@ -1160,17 +1761,15 @@ def classify_thematic_fields(
             mode="approx",
         )
         merged = merge_non_null_fields(merged, approx_result, fields_to_fill)
-
-        if not merged.get("confidence") and approx_result.get("confidence") is not None:
+        if merged.get("confidence") is None and approx_result.get("confidence") is not None:
             merged["confidence"] = approx_result.get("confidence")
         if not merged.get("justification") and approx_result.get("justification"):
             merged["justification"] = approx_result.get("justification")
         if not merged.get("classification_mode") and approx_result.get("classification_mode"):
             merged["classification_mode"] = approx_result.get("classification_mode")
 
-    needs_hints = any(not merged.get(field) for field in fields_to_fill)
-
-    if needs_hints:
+    # 3) deterministic hints exact
+    if missing_thematic_fields(merged):
         career_hint_result = classify_career_dimensions_by_hints(
             carrera=carrera,
             title_value=title_value,
@@ -1195,9 +1794,45 @@ def classify_thematic_fields(
                 "category_tematica_raw": idic_hint_result.get("category_tematica_raw"),
                 "area_idic_raw": idic_hint_result.get("area_idic_raw"),
                 "linea_idic_raw": idic_hint_result.get("linea_idic_raw"),
+                "classification_mode": merged.get("classification_mode") or "hints_strict",
             },
             fields_to_fill,
         )
+        if not merged.get("classification_mode") and has_any_thematic_field(merged):
+            merged["classification_mode"] = "hints_strict"
+
+    # 4) deterministic hints approx for remaining nulls
+    if missing_thematic_fields(merged):
+        career_hint_approx_result = classify_career_dimensions_by_hints_approx(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+        idic_hint_approx_result = classify_idic_dimensions_by_hints_approx(
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+
+        merged = merge_non_null_fields(
+            merged,
+            {
+                "area_carrera_raw": career_hint_approx_result.get("area_carrera_raw"),
+                "linea_carrera_raw": career_hint_approx_result.get("linea_carrera_raw"),
+                "category_tematica_raw": idic_hint_approx_result.get("category_tematica_raw"),
+                "area_idic_raw": idic_hint_approx_result.get("area_idic_raw"),
+                "linea_idic_raw": idic_hint_approx_result.get("linea_idic_raw"),
+            },
+            fields_to_fill,
+        )
+
+        if not merged.get("classification_mode") and has_any_thematic_field(merged):
+            merged["classification_mode"] = "hints_approx"
 
     if not is_valid_career_area_line(
         carrera,

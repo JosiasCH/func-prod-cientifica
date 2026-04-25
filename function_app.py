@@ -215,6 +215,96 @@ def choose_best_scored_candidate_relaxed(score_map: dict[str, int], min_score: i
     return positives[0][0]
 
 
+def choose_best_scored_candidate_with_margin(
+    score_map: dict[str, int],
+    min_score: int = 1,
+    min_margin: int = 1,
+) -> str | None:
+    positives = [(k, v) for k, v in score_map.items() if v >= min_score]
+    if not positives:
+        return None
+
+    positives.sort(key=lambda x: (-x[1], normalize_generic_text(x[0])))
+    best_key, best_score = positives[0]
+
+    if len(positives) == 1:
+        return best_key
+
+    second_score = positives[1][1]
+    if (best_score - second_score) < min_margin:
+        return None
+
+    return best_key
+
+
+THEMATIC_FIELD_WEIGHTS = {
+    "title": 7,
+    "abstract": 5,
+    "author_keywords": 4,
+    "index_keywords": 3,
+    "source_title": 1,
+}
+
+THEMATIC_STRICT_MIN_SCORE = 7
+THEMATIC_STRICT_MIN_MARGIN = 2
+THEMATIC_APPROX_MIN_SCORE = 4
+
+
+def build_thematic_text_fields(
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> dict[str, str]:
+    return {
+        "title": normalize_generic_text(title_value),
+        "abstract": normalize_generic_text(abstract_value),
+        "author_keywords": normalize_generic_text(author_keywords_value),
+        "index_keywords": normalize_generic_text(index_keywords_value),
+        "source_title": normalize_generic_text(source_title_value),
+    }
+
+
+def score_alias_in_thematic_fields(
+    text_fields: dict[str, str],
+    alias: str | None,
+    bonus: int = 0,
+) -> int:
+    alias_norm = normalize_generic_text(alias)
+    if not alias_norm:
+        return 0
+
+    score = 0
+    for field_name, text_value in text_fields.items():
+        if text_value and phrase_in_text(text_value, alias_norm):
+            score += THEMATIC_FIELD_WEIGHTS.get(field_name, 1) + bonus
+    return score
+
+
+def build_weighted_candidate_score(
+    text_fields: dict[str, str],
+    primary_aliases: list[str],
+    support_aliases: list[str],
+) -> int:
+    score = 0
+    seen: set[str] = set()
+
+    for alias in primary_aliases:
+        alias_norm = normalize_generic_text(alias)
+        if alias_norm and alias_norm not in seen:
+            score += score_alias_in_thematic_fields(text_fields, alias_norm, bonus=2)
+            seen.add(alias_norm)
+
+    for alias in support_aliases:
+        alias_norm = normalize_generic_text(alias)
+        if alias_norm and alias_norm not in seen:
+            score += score_alias_in_thematic_fields(text_fields, alias_norm, bonus=0)
+            seen.add(alias_norm)
+
+    return score
+
+
 def clip_text(value: str | None, max_chars: int = 7000) -> str | None:
     if not value:
         return None
@@ -784,6 +874,13 @@ CAREER_LINE_HINTS = {
             "silver nanoparticles",
             "green synthesis",
             "antimicrobial applications",
+            "stone mastic asphalt",
+            "sma mixtures",
+            "asphalt mixtures",
+            "sustainable fibres",
+            "waste derived fibres",
+            "material formulation",
+            "composite materials",
         ],
     },
     "Ingeniería Civil": {
@@ -1316,24 +1413,34 @@ def classify_career_dimensions_by_hints(
     if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
         return {"area_carrera_raw": None, "linea_carrera_raw": None}
 
-    corpus = build_text_corpus(
+    text_fields = build_thematic_text_fields(
         title_value,
         abstract_value,
         author_keywords_value,
         index_keywords_value,
         source_title_value,
     )
-    if not corpus:
+
+    if not any(text_fields.values()):
         return {"area_carrera_raw": None, "linea_carrera_raw": None}
 
     line_scores: dict[str, int] = {}
     for area_name, lineas in CAREER_AREA_LINE_CATALOG[carrera].items():
         for linea in lineas:
-            aliases = [linea, area_name]
-            aliases.extend(CAREER_LINE_HINTS.get(carrera, {}).get(linea, []))
-            line_scores[linea] = build_classification_score(corpus, aliases)
+            primary_aliases = [linea]
+            support_aliases = [area_name]
+            support_aliases.extend(CAREER_LINE_HINTS.get(carrera, {}).get(linea, []))
+            line_scores[linea] = build_weighted_candidate_score(
+                text_fields=text_fields,
+                primary_aliases=primary_aliases,
+                support_aliases=support_aliases,
+            )
 
-    best_linea = choose_best_scored_candidate(line_scores, min_score=1)
+    best_linea = choose_best_scored_candidate_with_margin(
+        line_scores,
+        min_score=THEMATIC_STRICT_MIN_SCORE,
+        min_margin=THEMATIC_STRICT_MIN_MARGIN,
+    )
     best_area = coerce_area_carrera_from_linea(carrera, best_linea) if best_linea else None
 
     return {"area_carrera_raw": best_area, "linea_carrera_raw": best_linea}
@@ -1350,24 +1457,33 @@ def classify_career_dimensions_by_hints_approx(
     if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
         return {"area_carrera_raw": None, "linea_carrera_raw": None}
 
-    corpus = build_text_corpus(
+    text_fields = build_thematic_text_fields(
         title_value,
         abstract_value,
         author_keywords_value,
         index_keywords_value,
         source_title_value,
     )
-    if not corpus:
+
+    if not any(text_fields.values()):
         return {"area_carrera_raw": None, "linea_carrera_raw": None}
 
     line_scores: dict[str, int] = {}
     for area_name, lineas in CAREER_AREA_LINE_CATALOG[carrera].items():
         for linea in lineas:
-            aliases = [linea, area_name]
-            aliases.extend(CAREER_LINE_HINTS.get(carrera, {}).get(linea, []))
-            line_scores[linea] = build_classification_score(corpus, aliases)
+            primary_aliases = [linea]
+            support_aliases = [area_name]
+            support_aliases.extend(CAREER_LINE_HINTS.get(carrera, {}).get(linea, []))
+            line_scores[linea] = build_weighted_candidate_score(
+                text_fields=text_fields,
+                primary_aliases=primary_aliases,
+                support_aliases=support_aliases,
+            )
 
-    best_linea = choose_best_scored_candidate_relaxed(line_scores, min_score=1)
+    best_linea = choose_best_scored_candidate_relaxed(
+        line_scores,
+        min_score=THEMATIC_APPROX_MIN_SCORE,
+    )
     best_area = coerce_area_carrera_from_linea(carrera, best_linea) if best_linea else None
 
     return {"area_carrera_raw": best_area, "linea_carrera_raw": best_linea}
@@ -1380,14 +1496,15 @@ def classify_idic_dimensions_by_hints(
     index_keywords_value: str | None,
     source_title_value: str | None,
 ) -> dict:
-    corpus = build_text_corpus(
+    text_fields = build_thematic_text_fields(
         title_value,
         abstract_value,
         author_keywords_value,
         index_keywords_value,
         source_title_value,
     )
-    if not corpus:
+
+    if not any(text_fields.values()):
         return {
             "category_tematica_raw": None,
             "area_idic_raw": None,
@@ -1398,11 +1515,20 @@ def classify_idic_dimensions_by_hints(
     for category_name, areas in IDIC_CATEGORY_AREA_LINE_CATALOG.items():
         for area_name, lineas in areas.items():
             for linea in lineas:
-                aliases = [linea, area_name, category_name]
-                aliases.extend(IDIC_LINE_HINTS.get(linea, []))
-                line_scores[linea] = build_classification_score(corpus, aliases)
+                primary_aliases = [linea]
+                support_aliases = [area_name, category_name]
+                support_aliases.extend(IDIC_LINE_HINTS.get(linea, []))
+                line_scores[linea] = build_weighted_candidate_score(
+                    text_fields=text_fields,
+                    primary_aliases=primary_aliases,
+                    support_aliases=support_aliases,
+                )
 
-    best_linea = choose_best_scored_candidate(line_scores, min_score=1)
+    best_linea = choose_best_scored_candidate_with_margin(
+        line_scores,
+        min_score=THEMATIC_STRICT_MIN_SCORE,
+        min_margin=THEMATIC_STRICT_MIN_MARGIN,
+    )
     best_area = coerce_area_idic_from_linea(best_linea) if best_linea else None
     best_category = coerce_category_tematica_from_area(best_area) if best_area else None
 
@@ -1426,14 +1552,15 @@ def classify_idic_dimensions_by_hints_approx(
     index_keywords_value: str | None,
     source_title_value: str | None,
 ) -> dict:
-    corpus = build_text_corpus(
+    text_fields = build_thematic_text_fields(
         title_value,
         abstract_value,
         author_keywords_value,
         index_keywords_value,
         source_title_value,
     )
-    if not corpus:
+
+    if not any(text_fields.values()):
         return {
             "category_tematica_raw": None,
             "area_idic_raw": None,
@@ -1444,11 +1571,19 @@ def classify_idic_dimensions_by_hints_approx(
     for category_name, areas in IDIC_CATEGORY_AREA_LINE_CATALOG.items():
         for area_name, lineas in areas.items():
             for linea in lineas:
-                aliases = [linea, area_name, category_name]
-                aliases.extend(IDIC_LINE_HINTS.get(linea, []))
-                line_scores[linea] = build_classification_score(corpus, aliases)
+                primary_aliases = [linea]
+                support_aliases = [area_name, category_name]
+                support_aliases.extend(IDIC_LINE_HINTS.get(linea, []))
+                line_scores[linea] = build_weighted_candidate_score(
+                    text_fields=text_fields,
+                    primary_aliases=primary_aliases,
+                    support_aliases=support_aliases,
+                )
 
-    best_linea = choose_best_scored_candidate_relaxed(line_scores, min_score=1)
+    best_linea = choose_best_scored_candidate_relaxed(
+        line_scores,
+        min_score=THEMATIC_APPROX_MIN_SCORE,
+    )
     best_area = coerce_area_idic_from_linea(best_linea) if best_linea else None
     best_category = coerce_category_tematica_from_area(best_area) if best_area else None
 
@@ -1553,14 +1688,17 @@ def build_thematic_classification_prompt(
             "cuando no exista evidencia suficiente para una clasificación exacta."
         )
         rules = [
-            "Usa principalmente title y abstract_scopus. Usa keywords y source_title solo como apoyo.",
-            "Debes elegir solo valores existentes en los catálogos proporcionados.",
-            "No inventes áreas, líneas o categorías.",
+            "Trabaja con catálogo cerrado: solo puedes devolver valores existentes en los catálogos proporcionados.",
+            "No inventes áreas, líneas ni categorías.",
+            "El artículo pertenece a la carrera indicada; la clasificación de carrera debe quedar dentro de esa carrera.",
+            "Distingue claramente author_keywords de index_keywords: no son lo mismo y deben tratarse como evidencias separadas.",
+            "Usa principalmente title y abstract_scopus para decidir el problema central, el objeto de estudio y el aporte principal.",
+            "Usa author_keywords e index_keywords como apoyo; usa source_title solo como evidencia débil.",
             "Primero intenta una clasificación exacta.",
-            "Si no hay evidencia suficiente para exactitud total, elige la opción más próxima semánticamente dentro del catálogo.",
-            "Para artículos de ingeniería, prioriza no dejar campos vacíos cuando exista una aproximación razonable y defendible.",
+            "Si no hay evidencia suficiente para exactitud total, elige la opción más cercana y defendible dentro del catálogo.",
             "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
             "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
+            "Evita clasificar por palabras genéricas muy amplias si el título y resumen apuntan a un tema más específico.",
             "Si realmente no hay base razonable, devuelve null.",
             "Devuelve únicamente JSON válido, sin markdown ni comentarios.",
         ]
@@ -1569,12 +1707,16 @@ def build_thematic_classification_prompt(
             "Eres un clasificador temático estricto para publicaciones académicas de ingeniería."
         )
         rules = [
-            "Usa principalmente title y abstract_scopus. Usa keywords y source_title solo como apoyo.",
-            "Debes elegir solo valores existentes en los catálogos proporcionados.",
-            "No inventes áreas, líneas o categorías.",
+            "Trabaja con catálogo cerrado: solo puedes devolver valores existentes en los catálogos proporcionados.",
+            "No inventes áreas, líneas ni categorías.",
+            "El artículo pertenece a la carrera indicada; la clasificación de carrera debe quedar dentro de esa carrera.",
+            "Distingue claramente author_keywords de index_keywords: no son lo mismo y deben tratarse como evidencias separadas.",
+            "Usa principalmente title y abstract_scopus para decidir el problema central, el objeto de estudio y el aporte principal.",
+            "Usa author_keywords e index_keywords como apoyo; usa source_title solo como evidencia débil.",
             "Si no hay evidencia suficiente, devuelve null en los campos inciertos.",
             "Si eliges linea_carrera_raw, debe pertenecer a la carrera dada y ser consistente con area_carrera_raw.",
             "Si eliges linea_idic_raw, debe ser consistente con area_idic_raw y category_tematica_raw.",
+            "Evita clasificar por palabras genéricas muy amplias si el título y resumen apuntan a un tema más específico.",
             "Devuelve únicamente JSON válido, sin markdown ni comentarios.",
         ]
 
@@ -1727,10 +1869,15 @@ def classify_thematic_fields(
     if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
         return merged
 
-    career_fields = ["area_carrera_raw", "linea_carrera_raw"]
-    idic_fields = ["category_tematica_raw", "area_idic_raw", "linea_idic_raw"]
+    all_fields = [
+        "area_carrera_raw",
+        "linea_carrera_raw",
+        "category_tematica_raw",
+        "area_idic_raw",
+        "linea_idic_raw",
+    ]
 
-    # 1) LLM strict para TODO
+    # 1) LLM strict para todo
     strict_result = classify_thematic_fields_with_llm(
         carrera=carrera,
         title_value=title_value,
@@ -1741,11 +1888,7 @@ def classify_thematic_fields(
         mode="strict",
     )
 
-    merged = merge_non_null_fields(
-        merged,
-        strict_result,
-        career_fields + idic_fields,
-    )
+    merged = merge_non_null_fields(merged, strict_result, all_fields)
 
     if strict_result.get("confidence") is not None:
         merged["confidence"] = strict_result.get("confidence")
@@ -1754,8 +1897,8 @@ def classify_thematic_fields(
     if strict_result.get("classification_mode"):
         merged["classification_mode"] = strict_result.get("classification_mode")
 
-    # 2) LLM approx SOLO para carrera
-    if any(not merged.get(field) for field in career_fields):
+    # 2) LLM approx para cualquier campo faltante
+    if missing_thematic_fields(merged):
         approx_result = classify_thematic_fields_with_llm(
             carrera=carrera,
             title_value=title_value,
@@ -1766,14 +1909,10 @@ def classify_thematic_fields(
             mode="approx",
         )
 
-        merged = merge_non_null_fields(
-            merged,
-            approx_result,
-            career_fields,
-        )
+        merged = merge_non_null_fields(merged, approx_result, all_fields)
 
         if (
-            any(approx_result.get(field) for field in career_fields)
+            has_any_thematic_field(approx_result)
             and merged.get("classification_mode") != "strict"
         ):
             merged["classification_mode"] = approx_result.get("classification_mode") or "approx"
@@ -1784,8 +1923,8 @@ def classify_thematic_fields(
         if not merged.get("justification") and approx_result.get("justification"):
             merged["justification"] = approx_result.get("justification")
 
-    # 3) Hints strict para carrera
-    if any(not merged.get(field) for field in career_fields):
+    # 3) Hints strict para carrera + IDIC
+    if missing_thematic_fields(merged):
         career_hint_result = classify_career_dimensions_by_hints(
             carrera=carrera,
             title_value=title_value,
@@ -1794,44 +1933,6 @@ def classify_thematic_fields(
             index_keywords_value=index_keywords_value,
             source_title_value=source_title_value,
         )
-
-        merged = merge_non_null_fields(
-            merged,
-            career_hint_result,
-            career_fields,
-        )
-
-        if (
-            any(career_hint_result.get(field) for field in career_fields)
-            and not merged.get("classification_mode")
-        ):
-            merged["classification_mode"] = "career_hints_strict"
-
-    # 4) Hints approx SOLO para carrera
-    if any(not merged.get(field) for field in career_fields):
-        career_hint_approx_result = classify_career_dimensions_by_hints_approx(
-            carrera=carrera,
-            title_value=title_value,
-            abstract_value=abstract_value,
-            author_keywords_value=author_keywords_value,
-            index_keywords_value=index_keywords_value,
-            source_title_value=source_title_value,
-        )
-
-        merged = merge_non_null_fields(
-            merged,
-            career_hint_approx_result,
-            career_fields,
-        )
-
-        if (
-            any(career_hint_approx_result.get(field) for field in career_fields)
-            and not merged.get("classification_mode")
-        ):
-            merged["classification_mode"] = "career_hints_approx"
-
-    # 5) Hints strict para IDIC
-    if any(not merged.get(field) for field in idic_fields):
         idic_hint_result = classify_idic_dimensions_by_hints(
             title_value=title_value,
             abstract_value=abstract_value,
@@ -1842,15 +1943,56 @@ def classify_thematic_fields(
 
         merged = merge_non_null_fields(
             merged,
-            idic_hint_result,
-            idic_fields,
+            {
+                "area_carrera_raw": career_hint_result.get("area_carrera_raw"),
+                "linea_carrera_raw": career_hint_result.get("linea_carrera_raw"),
+                "category_tematica_raw": idic_hint_result.get("category_tematica_raw"),
+                "area_idic_raw": idic_hint_result.get("area_idic_raw"),
+                "linea_idic_raw": idic_hint_result.get("linea_idic_raw"),
+            },
+            all_fields,
         )
 
-        if (
-            any(idic_hint_result.get(field) for field in idic_fields)
-            and not merged.get("classification_mode")
+        if not merged.get("classification_mode") and (
+            has_any_thematic_field(career_hint_result) or has_any_thematic_field(idic_hint_result)
         ):
-            merged["classification_mode"] = "idic_hints_strict"
+            merged["classification_mode"] = "hints_strict"
+
+    # 4) Hints approx para carrera + IDIC
+    if missing_thematic_fields(merged):
+        career_hint_approx_result = classify_career_dimensions_by_hints_approx(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+        idic_hint_approx_result = classify_idic_dimensions_by_hints_approx(
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+
+        merged = merge_non_null_fields(
+            merged,
+            {
+                "area_carrera_raw": career_hint_approx_result.get("area_carrera_raw"),
+                "linea_carrera_raw": career_hint_approx_result.get("linea_carrera_raw"),
+                "category_tematica_raw": idic_hint_approx_result.get("category_tematica_raw"),
+                "area_idic_raw": idic_hint_approx_result.get("area_idic_raw"),
+                "linea_idic_raw": idic_hint_approx_result.get("linea_idic_raw"),
+            },
+            all_fields,
+        )
+
+        if not merged.get("classification_mode") and (
+            has_any_thematic_field(career_hint_approx_result)
+            or has_any_thematic_field(idic_hint_approx_result)
+        ):
+            merged["classification_mode"] = "hints_approx"
 
     # Validación final
     if not is_valid_career_area_line(

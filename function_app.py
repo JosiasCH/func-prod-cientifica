@@ -2064,6 +2064,37 @@ IDIC_SUSTAINABLE_INFRASTRUCTURE_STRONG_SIGNALS = [
     "construction infrastructure",
 ]
 
+IDIC_EMERGING_TECH_STRONG_SIGNALS = [
+    "emerging technologies",
+    "tecnologias emergentes",
+    "tecnologías emergentes",
+    "computational characterization",
+    "caracterizacion computacional",
+    "caracterización computacional",
+    "density functional theory",
+    "dft",
+    "molecular docking",
+    "molecular dynamics",
+    "spectroscopic",
+    "spectroscopy",
+    "spectrometric",
+    "mass spectrometry",
+    "esi ms",
+    "esi-ms",
+    "hplc",
+    "uhplc",
+    "orbitrap",
+    "chromatography",
+    "chemical characterization",
+    "bioactive compounds",
+    "secondary metabolites",
+    "antitubercular",
+    "isoniazid",
+    "hydrazones",
+    "drug derivatives",
+    "novel derivatives",
+]
+
 
 def contains_any_phrase_in_text_fields(text_fields: dict[str, str], phrases: list[str]) -> bool:
     for phrase in phrases:
@@ -2260,6 +2291,47 @@ def choose_non_climate_sustainability_idic_alternative(
     return None, None, None, None
 
 
+def choose_general_idic_fallback(
+    text_fields: dict[str, str],
+) -> tuple[str, str, str, str]:
+    """
+    Fallback final obligatorio para evitar NULLs en IDIC.
+
+    Esta función solo se usa cuando LLM + hints + guardrails no logran producir
+    una clasificación IDIC completa. Mantiene el criterio general del proyecto:
+    elegir la alternativa más cercana dentro del catálogo, sin usar
+    'Adaptación al cambio climático' salvo que exista evidencia climática explícita.
+    """
+    alternative_category, alternative_area, alternative_line, source = choose_non_climate_sustainability_idic_alternative(text_fields)
+    if alternative_category and alternative_area and alternative_line:
+        return alternative_category, alternative_area, alternative_line, source or "idic_general_fallback_sustainability"
+
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_MACHINE_LEARNING_STRONG_SIGNALS):
+        return (
+            "Innovación y tecnología digital",
+            "Inteligencia artificial y computación avanzada",
+            "Machine learning y deep learning",
+            "idic_general_fallback_machine_learning",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_EMERGING_TECH_STRONG_SIGNALS):
+        return (
+            "Innovación y tecnología digital",
+            "Transformación digital",
+            "Tecnologías emergentes",
+            "idic_general_fallback_emerging_technologies",
+        )
+
+    # Último recurso institucional: nunca dejar IDIC en NULL.
+    # Se elige una línea amplia, válida y menos engañosa que forzar adaptación climática.
+    return (
+        "Innovación y tecnología digital",
+        "Transformación digital",
+        "Tecnologías emergentes",
+        "idic_general_fallback_default_emerging_technologies",
+    )
+
+
 def is_idic_line_eligible_by_domain_rules(linea: str, text_fields: dict[str, str]) -> bool:
     innovation_present = contains_any_phrase_in_text_fields(
         text_fields,
@@ -2355,6 +2427,13 @@ def apply_idic_line_bonus(linea: str, text_fields: dict[str, str], base_score: i
         bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_SUSTAINABLE_INFRASTRUCTURE_STRONG_SIGNALS)
         return base_score + bonus
 
+    if linea == "Tecnologías emergentes":
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, IDIC_EMERGING_TECH_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, IDIC_EMERGING_TECH_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_EMERGING_TECH_STRONG_SIGNALS)
+        return base_score + bonus
+
     return base_score
 
 
@@ -2435,12 +2514,8 @@ def apply_final_idic_guardrails(
         if alternative_category and alternative_area and alternative_line:
             return alternative_category, alternative_area, alternative_line, source
 
-        return (
-            None,
-            None,
-            None,
-            "idic_guardrail_reject_climate_adaptation_without_evidence",
-        )
+        fallback_category, fallback_area, fallback_line, fallback_source = choose_general_idic_fallback(text_fields)
+        return fallback_category, fallback_area, fallback_line, fallback_source
 
     return category_tematica, area_idic, linea_idic, None
 
@@ -2552,10 +2627,11 @@ def classify_idic_dimensions_force_best(
     best_score = line_scores.get(best_linea, 0)
 
     if best_score < THEMATIC_APPROX_MIN_SCORE:
+        fallback_category, fallback_area, fallback_line, _fallback_source = choose_general_idic_fallback(text_fields)
         return {
-            "category_tematica_raw": None,
-            "area_idic_raw": None,
-            "linea_idic_raw": None,
+            "category_tematica_raw": fallback_category,
+            "area_idic_raw": fallback_area,
+            "linea_idic_raw": fallback_line,
         }
 
     best_area = coerce_area_idic_from_linea(best_linea)
@@ -2569,11 +2645,8 @@ def classify_idic_dimensions_force_best(
     ) = apply_final_idic_guardrails(best_category, best_area, best_linea, text_fields)
 
     if not is_valid_idic_triplet(best_category, best_area, best_linea):
-        return {
-            "category_tematica_raw": None,
-            "area_idic_raw": None,
-            "linea_idic_raw": None,
-        }
+        fallback_category, fallback_area, fallback_line, _fallback_source = choose_general_idic_fallback(text_fields)
+        best_category, best_area, best_linea = fallback_category, fallback_area, fallback_line
 
     return {
         "category_tematica_raw": best_category,
@@ -3350,6 +3423,15 @@ def classify_thematic_fields(
         if any(idic_forced.get(field) for field in idic_fields):
             append_classification_source(merged, "idic_force_best")
             set_first_justification(merged, "Fallback final obligatorio de IDIC para evitar NULLs.")
+
+    # Safety net: por regla del proyecto, ningún registro aceptado debe salir con IDIC en NULL.
+    if any(not merged.get(field) for field in idic_fields):
+        fallback_category, fallback_area, fallback_line, fallback_source = choose_general_idic_fallback(text_fields)
+        merged["category_tematica_raw"] = fallback_category
+        merged["area_idic_raw"] = fallback_area
+        merged["linea_idic_raw"] = fallback_line
+        append_classification_source(merged, fallback_source)
+        set_first_justification(merged, "Fallback institucional obligatorio de IDIC para evitar NULLs.")
 
     return merged
 

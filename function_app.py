@@ -664,6 +664,24 @@ VALID_SCOPUS_DOCUMENT_TYPES = {
     "conference paper",
 }
 
+ULIMA_ENGINEERING_CONTEXT_HINTS = [
+    "facultad de ingenieria",
+    "faculty of engineering",
+    "school of engineering",
+    "engineering school",
+    "escuela de ingenieria",
+    "department of engineering",
+    "departamento de ingenieria",
+]
+
+EXTERNAL_INSTITUTION_BOUNDARY_HINTS = [
+    "universidad",
+    "university",
+    "college",
+    "polytechnic",
+    "politecnico",
+]
+
 
 def filter_valid_engineering_careers(careers: list[str] | None) -> list[str]:
     if not careers:
@@ -679,13 +697,99 @@ def is_valid_scopus_document_type(value: str | None) -> bool:
     return normalize_document_type_for_filter(value) in VALID_SCOPUS_DOCUMENT_TYPES
 
 
-def resolve_engineering_careers_from_affiliation_text(*values: str | None) -> list[str]:
-    detected: list[str] = []
-    for value in values:
-        if not is_ulima_text(value):
+def split_affiliation_clauses(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in str(value).split(",") if part and str(part).strip()]
+
+
+
+def has_external_institution_boundary(value: str | None) -> bool:
+    norm = normalize_generic_text(value)
+    if not norm or is_ulima_text(value):
+        return False
+    return any(hint in norm for hint in EXTERNAL_INSTITUTION_BOUNDARY_HINTS)
+
+
+
+def extract_ulima_local_contexts(value: str | None, max_lookback: int = 3) -> list[str]:
+    if not value or not is_ulima_text(value):
+        return []
+
+    clauses = split_affiliation_clauses(value)
+    if not clauses:
+        return []
+
+    contexts: list[str] = []
+    for idx, clause in enumerate(clauses):
+        if not is_ulima_text(clause):
             continue
-        detected.extend(infer_careers_from_text(value))
-    return filter_valid_engineering_careers(detected)
+
+        start_idx = idx
+        steps = 0
+        while start_idx > 0 and steps < max_lookback:
+            previous_clause = clauses[start_idx - 1]
+            if has_external_institution_boundary(previous_clause):
+                break
+            start_idx -= 1
+            steps += 1
+
+        context = ", ".join(clauses[start_idx : idx + 1]).strip(" ,")
+        if context:
+            contexts.append(context)
+
+    return unique_keep_order(contexts)
+
+
+
+def extract_ulima_local_contexts_from_values(*values: str | None) -> list[str]:
+    contexts: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        parts = split_semicolon_values(value)
+        if not parts:
+            parts = [str(value)]
+        for part in parts:
+            contexts.extend(extract_ulima_local_contexts(part))
+    return unique_keep_order(contexts)
+
+
+
+def is_ulima_engineering_context(value: str | None) -> bool:
+    if not value or not is_ulima_text(value):
+        return False
+
+    if filter_valid_engineering_careers(infer_careers_from_text(value)):
+        return True
+
+    norm = normalize_generic_text(value)
+    return any(hint in norm for hint in ULIMA_ENGINEERING_CONTEXT_HINTS)
+
+
+
+def resolve_engineering_affiliation_details(*values: str | None) -> dict:
+    ulima_contexts = extract_ulima_local_contexts_from_values(*values)
+    detected_careers: list[str] = []
+    has_engineering_context = False
+
+    for context in ulima_contexts:
+        detected_careers.extend(filter_valid_engineering_careers(infer_careers_from_text(context)))
+        if is_ulima_engineering_context(context):
+            has_engineering_context = True
+
+    return {
+        "ulima_contexts": ulima_contexts,
+        "careers": unique_keep_order(detected_careers),
+        "has_ulima_affiliation": bool(ulima_contexts),
+        "has_ulima_engineering_context": has_engineering_context,
+    }
+
+
+
+def resolve_engineering_careers_from_affiliation_text(*values: str | None) -> list[str]:
+    return resolve_engineering_affiliation_details(*values).get("careers", [])
+
 
 
 def determine_row_engineering_eligibility(
@@ -705,18 +809,19 @@ def determine_row_engineering_eligibility(
     careers_from_enrichment = filter_valid_engineering_careers(
         split_semicolon_values(enrichment.get("carrera_raw"))
     )
-    if careers_from_enrichment:
+    if careers_from_enrichment and enrichment.get("has_ulima_engineering_affiliation_raw"):
         return {
             "eligible": True,
             "carrera_raw": "; ".join(careers_from_enrichment),
             "reason": None,
         }
 
-    careers_from_affiliation = resolve_engineering_careers_from_affiliation_text(
+    affiliation_details = resolve_engineering_affiliation_details(
         authors_with_affiliations_value,
         affiliations_value,
     )
-    if careers_from_affiliation:
+    careers_from_affiliation = filter_valid_engineering_careers(affiliation_details.get("careers"))
+    if careers_from_affiliation and affiliation_details.get("has_ulima_engineering_context"):
         return {
             "eligible": True,
             "carrera_raw": "; ".join(careers_from_affiliation),
@@ -3843,26 +3948,25 @@ def match_scopus_author_to_docente(
 # AFFILIATION-FIRST + AUTHOR FALLBACK
 # =========================
 def get_publication_level_engineering_careers(affiliations_value: str | None) -> list[str]:
-    if not is_ulima_text(affiliations_value):
-        return []
-    return unique_keep_order(infer_careers_from_text(affiliations_value))
+    publication_details = resolve_engineering_affiliation_details(affiliations_value)
+    return filter_valid_engineering_careers(publication_details.get("careers"))
+
 
 
 def get_block_engineering_careers(
     block_value: str | None,
     publication_level_careers: list[str],
 ) -> list[str]:
-    if not is_ulima_text(block_value):
-        return []
-
-    block_careers = unique_keep_order(infer_careers_from_text(block_value))
+    block_details = resolve_engineering_affiliation_details(block_value)
+    block_careers = filter_valid_engineering_careers(block_details.get("careers"))
     if block_careers:
         return block_careers
 
-    if len(publication_level_careers) == 1:
+    if block_details.get("has_ulima_engineering_context") and len(publication_level_careers) == 1:
         return publication_level_careers
 
     return []
+
 
 
 def enrich_ulima_fields_from_ref(
@@ -3878,20 +3982,29 @@ def enrich_ulima_fields_from_ref(
         author_full_names_value=author_full_names_value,
         authors_with_affiliations_value=authors_with_affiliations_value,
     )
+    if not author_blocks and affiliations_value:
+        author_blocks = split_semicolon_values(affiliations_value)
+        if not author_blocks:
+            author_blocks = [str(affiliations_value)]
 
-    publication_level_careers = get_publication_level_engineering_careers(affiliations_value)
+    publication_details = resolve_engineering_affiliation_details(affiliations_value)
+    publication_level_careers = filter_valid_engineering_careers(publication_details.get("careers"))
 
     ulima_authors_detected: list[str] = []
     publication_careers: list[str] = []
     first_author_ulima = False
     matched_any = False
     affiliation_ulima_detected = False
+    has_ulima_engineering_affiliation = False
 
     for idx, block in enumerate(author_blocks):
-        if not is_ulima_text(block):
+        block_details = resolve_engineering_affiliation_details(block)
+        if not block_details.get("has_ulima_affiliation"):
             continue
 
         affiliation_ulima_detected = True
+        if block_details.get("has_ulima_engineering_context"):
+            has_ulima_engineering_affiliation = True
 
         preferred_author_name = get_preferred_author_name_for_block(
             idx=idx,
@@ -3929,13 +4042,18 @@ def enrich_ulima_fields_from_ref(
             matched_any = True
             docente = match_result["docente"]
 
-            if not block_careers and docente.get("carrera"):
+            if (
+                not block_careers
+                and block_details.get("has_ulima_engineering_context")
+                and docente.get("carrera") in VALID_ENGINEERING_CAREERS
+            ):
                 block_careers = [docente.get("carrera")]
 
-        publication_careers.extend(block_careers)
+        publication_careers.extend(filter_valid_engineering_careers(block_careers))
 
-    if not publication_careers and publication_level_careers:
+    if not publication_careers and publication_level_careers and publication_details.get("has_ulima_engineering_context"):
         publication_careers.extend(publication_level_careers)
+        has_ulima_engineering_affiliation = True
 
     publication_careers = unique_keep_order([c for c in publication_careers if c])
     ulima_authors_detected = unique_keep_order([a for a in ulima_authors_detected if a])
@@ -3955,6 +4073,7 @@ def enrich_ulima_fields_from_ref(
         "carrera_raw": "; ".join(publication_careers) if publication_careers else None,
         "metodo_cruce_scopus_raw": metodo,
         "es_ulima_raw_detected": affiliation_ulima_detected,
+        "has_ulima_engineering_affiliation_raw": has_ulima_engineering_affiliation,
     }
 
 

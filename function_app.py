@@ -1876,8 +1876,6 @@ INDUSTRIAL_PDD_STRONG_SIGNALS = [
     "material",
     "advanced material",
     "composite",
-    "formulation",
-    "synthesis",
     "green synthesis",
     "nanoparticles",
     "silver nanoparticles",
@@ -1885,8 +1883,6 @@ INDUSTRIAL_PDD_STRONG_SIGNALS = [
     "fibers",
     "asphalt",
     "stone mastic asphalt",
-    "characterization",
-    "characterisation",
     "valorization",
     "valorisation",
 ]
@@ -1921,6 +1917,151 @@ IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS = [
     "organizational redesign",
     "restructuring",
     "digital transformation",
+]
+
+
+IDIC_MACHINE_LEARNING_STRONG_SIGNALS = [
+    "machine learning",
+    "deep learning",
+    "aprendizaje automatico",
+    "aprendizaje automático",
+    "predictive model",
+    "predictive models",
+    "prediction model",
+    "prediction models",
+    "benchmarking",
+    "multi model",
+    "multi-model",
+    "model benchmarking",
+]
+
+IDIC_CLIMATE_ADAPTATION_EXACT_SIGNALS = [
+    "adaptacion al cambio climatico",
+    "adaptación al cambio climático",
+    "climate change adaptation",
+    "adaptation to climate change",
+    "climate adaptation",
+]
+
+IDIC_CLIMATE_TERMS = [
+    "climate change",
+    "cambio climatico",
+    "cambio climático",
+    "climatic change",
+    "climate variability",
+    "variabilidad climatica",
+    "variabilidad climática",
+    "global warming",
+    "calentamiento global",
+]
+
+IDIC_ADAPTATION_CONTEXT_TERMS = [
+    "adaptation",
+    "adaptacion",
+    "adaptación",
+    "resilience",
+    "resiliencia",
+    "vulnerability",
+    "vulnerabilidad",
+    "climate risk",
+    "riesgo climatico",
+    "riesgo climático",
+    "climate hazard",
+    "amenaza climatica",
+    "amenaza climática",
+    "climate impact",
+    "impacto climatico",
+    "impacto climático",
+    "exposure",
+    "exposicion",
+    "exposición",
+]
+
+IDIC_CIRCULAR_ECONOMY_STRONG_SIGNALS = [
+    "circular economy",
+    "economia circular",
+    "economía circular",
+    "valorization",
+    "valorisation",
+    "valorizacion",
+    "valorización",
+    "waste valorization",
+    "recycling",
+    "reciclaje",
+    "reuse",
+    "reutilizacion",
+    "reutilización",
+]
+
+IDIC_CLEAN_TECH_STRONG_SIGNALS = [
+    "clean technology",
+    "clean technologies",
+    "tecnologias limpias",
+    "tecnologías limpias",
+    "green synthesis",
+    "sintesis verde",
+    "síntesis verde",
+    "eco friendly",
+    "eco-friendly",
+    "sustainable valorization",
+    "sustainable valorisation",
+    "valorizacion sostenible",
+    "valorización sostenible",
+]
+
+IDIC_WASTE_MANAGEMENT_STRONG_SIGNALS = [
+    "waste management",
+    "gestion de residuos",
+    "gestión de residuos",
+    "waste",
+    "residuos",
+    "sludge",
+    "lodo",
+    "adsorption",
+    "adsorcion",
+    "adsorción",
+    "removal",
+    "remocion",
+    "remoción",
+]
+
+IDIC_ADVANCED_MATERIALS_STRONG_SIGNALS = [
+    "advanced materials",
+    "materiales avanzados",
+    "nanoparticles",
+    "nanoparticulas",
+    "nanopartículas",
+    "silver nanoparticles",
+    "composite",
+    "composites",
+    "material formulation",
+    "fiber reinforced",
+    "fibre reinforced",
+    "fiber-reinforced",
+    "fibre-reinforced",
+    "concrete",
+    "concreto",
+    "beam",
+    "beams",
+    "vigas",
+    "cyclic loading",
+    "carga ciclica",
+    "carga cíclica",
+    "structural response",
+    "respuesta estructural",
+    "asphalt",
+    "asfalto",
+]
+
+IDIC_SUSTAINABLE_INFRASTRUCTURE_STRONG_SIGNALS = [
+    "sustainable infrastructure",
+    "infraestructura sostenible",
+    "urban infrastructure",
+    "road infrastructure",
+    "infraestructura vial",
+    "pavement",
+    "pavimento",
+    "construction infrastructure",
 ]
 
 
@@ -2061,6 +2202,64 @@ def choose_best_line_with_rules(
 
 
 
+def has_climate_adaptation_evidence(text_fields: dict[str, str]) -> bool:
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_CLIMATE_ADAPTATION_EXACT_SIGNALS):
+        return True
+
+    climate_present = contains_any_phrase_in_text_fields(text_fields, IDIC_CLIMATE_TERMS)
+    adaptation_context_present = contains_any_phrase_in_text_fields(
+        text_fields,
+        IDIC_ADAPTATION_CONTEXT_TERMS,
+    )
+    return climate_present and adaptation_context_present
+
+
+def choose_non_climate_sustainability_idic_alternative(
+    text_fields: dict[str, str],
+) -> tuple[str | None, str | None, str | None, str | None]:
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_CIRCULAR_ECONOMY_STRONG_SIGNALS):
+        return (
+            "Desarrollo sostenible y medioambiente",
+            "Sostenibilidad y cambio climático",
+            "Economía circular",
+            "idic_guardrail_circular_economy_over_climate_adaptation",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_CLEAN_TECH_STRONG_SIGNALS):
+        return (
+            "Desarrollo sostenible y medioambiente",
+            "Tecnología y ecosistemas",
+            "Tecnologías limpias",
+            "idic_guardrail_clean_tech_over_climate_adaptation",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_WASTE_MANAGEMENT_STRONG_SIGNALS):
+        return (
+            "Desarrollo sostenible y medioambiente",
+            "Tecnología y ecosistemas",
+            "Gestión de residuos",
+            "idic_guardrail_waste_over_climate_adaptation",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_ADVANCED_MATERIALS_STRONG_SIGNALS):
+        return (
+            "Desarrollo sostenible y medioambiente",
+            "Tecnología y ecosistemas",
+            "Materiales avanzados",
+            "idic_guardrail_materials_over_climate_adaptation",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_SUSTAINABLE_INFRASTRUCTURE_STRONG_SIGNALS):
+        return (
+            "Desarrollo sostenible y medioambiente",
+            "Ciudades inteligentes y sostenibles",
+            "Infraestructura sostenible",
+            "idic_guardrail_infrastructure_over_climate_adaptation",
+        )
+
+    return None, None, None, None
+
+
 def is_idic_line_eligible_by_domain_rules(linea: str, text_fields: dict[str, str]) -> bool:
     innovation_present = contains_any_phrase_in_text_fields(
         text_fields,
@@ -2072,6 +2271,9 @@ def is_idic_line_eligible_by_domain_rules(linea: str, text_fields: dict[str, str
     )
 
     if linea == "Transformación organizacional" and innovation_present and not transformation_present:
+        return False
+
+    if linea == "Adaptación al cambio climático" and not has_climate_adaptation_evidence(text_fields):
         return False
 
     return True
@@ -2099,6 +2301,58 @@ def apply_idic_line_bonus(linea: str, text_fields: dict[str, str], base_score: i
         bonus += 4 * count_phrase_hits_in_text(title_text, IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS)
         bonus += 2 * count_phrase_hits_in_text(keyword_text, IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS)
         bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Machine learning y deep learning":
+        bonus = 0
+        bonus += 6 * count_phrase_hits_in_text(title_text, IDIC_MACHINE_LEARNING_STRONG_SIGNALS)
+        bonus += 3 * count_phrase_hits_in_text(keyword_text, IDIC_MACHINE_LEARNING_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(abstract_text, IDIC_MACHINE_LEARNING_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Adaptación al cambio climático":
+        bonus = 0
+        bonus += 5 * count_phrase_hits_in_text(title_text, IDIC_CLIMATE_ADAPTATION_EXACT_SIGNALS)
+        bonus += 3 * count_phrase_hits_in_text(keyword_text, IDIC_CLIMATE_ADAPTATION_EXACT_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(abstract_text, IDIC_CLIMATE_ADAPTATION_EXACT_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(title_text, IDIC_CLIMATE_TERMS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_CLIMATE_TERMS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_ADAPTATION_CONTEXT_TERMS)
+        return base_score + bonus
+
+    if linea == "Economía circular":
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, IDIC_CIRCULAR_ECONOMY_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, IDIC_CIRCULAR_ECONOMY_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_CIRCULAR_ECONOMY_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Tecnologías limpias":
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, IDIC_CLEAN_TECH_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, IDIC_CLEAN_TECH_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_CLEAN_TECH_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Gestión de residuos":
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, IDIC_WASTE_MANAGEMENT_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, IDIC_WASTE_MANAGEMENT_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_WASTE_MANAGEMENT_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Materiales avanzados":
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, IDIC_ADVANCED_MATERIALS_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, IDIC_ADVANCED_MATERIALS_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_ADVANCED_MATERIALS_STRONG_SIGNALS)
+        return base_score + bonus
+
+    if linea == "Infraestructura sostenible":
+        bonus = 0
+        bonus += 4 * count_phrase_hits_in_text(title_text, IDIC_SUSTAINABLE_INFRASTRUCTURE_STRONG_SIGNALS)
+        bonus += 2 * count_phrase_hits_in_text(keyword_text, IDIC_SUSTAINABLE_INFRASTRUCTURE_STRONG_SIGNALS)
+        bonus += 1 * count_phrase_hits_in_text(abstract_text, IDIC_SUSTAINABLE_INFRASTRUCTURE_STRONG_SIGNALS)
         return base_score + bonus
 
     return base_score
@@ -2172,6 +2426,20 @@ def apply_final_idic_guardrails(
             area_idic,
             "Gestión de la innovación",
             "idic_guardrail_innovation_over_transformation",
+        )
+
+    if linea_idic == "Adaptación al cambio climático" and not has_climate_adaptation_evidence(text_fields):
+        alternative_category, alternative_area, alternative_line, source = choose_non_climate_sustainability_idic_alternative(
+            text_fields
+        )
+        if alternative_category and alternative_area and alternative_line:
+            return alternative_category, alternative_area, alternative_line, source
+
+        return (
+            None,
+            None,
+            None,
+            "idic_guardrail_reject_climate_adaptation_without_evidence",
         )
 
     return category_tematica, area_idic, linea_idic, None
@@ -2263,11 +2531,14 @@ def classify_idic_dimensions_force_best(
                 primary_aliases = [linea]
                 support_aliases = [area_name, category_name]
                 support_aliases.extend(IDIC_LINE_HINTS.get(linea, []))
-                line_scores[linea] = build_weighted_candidate_score(
+                base_score = build_weighted_candidate_score(
                     text_fields=text_fields,
                     primary_aliases=primary_aliases,
                     support_aliases=support_aliases,
                 )
+                if not is_idic_line_eligible_by_domain_rules(linea, text_fields):
+                    continue
+                line_scores[linea] = apply_idic_line_bonus(linea, text_fields, base_score)
 
     if not line_scores:
         return {
@@ -2278,8 +2549,24 @@ def classify_idic_dimensions_force_best(
 
     ranked = sorted(line_scores.keys(), key=lambda x: (-line_scores.get(x, 0), normalize_generic_text(x)))
     best_linea = ranked[0]
+    best_score = line_scores.get(best_linea, 0)
+
+    if best_score < THEMATIC_APPROX_MIN_SCORE:
+        return {
+            "category_tematica_raw": None,
+            "area_idic_raw": None,
+            "linea_idic_raw": None,
+        }
+
     best_area = coerce_area_idic_from_linea(best_linea)
     best_category = coerce_category_tematica_from_area(best_area)
+
+    (
+        best_category,
+        best_area,
+        best_linea,
+        _guardrail_source,
+    ) = apply_final_idic_guardrails(best_category, best_area, best_linea, text_fields)
 
     if not is_valid_idic_triplet(best_category, best_area, best_linea):
         return {
@@ -2655,6 +2942,8 @@ def build_idic_classification_prompt(
         "Dentro de 'Gestión y economía del conocimiento' > 'Innovación empresarial', favorece 'Gestión de la innovación' cuando el foco sea 5S, standard work, lean, mejora continua, mejora de procesos, eficiencia operativa o productividad.",
         "Dentro de 'Gestión y economía del conocimiento' > 'Innovación empresarial', usa 'Transformación organizacional' solo cuando el aporte central trate explícitamente de transformación, rediseño o cambio organizacional.",
         "Distingue claramente entre enfoques de tecnología digital, sostenibilidad y comportamiento humano según el aporte central del artículo.",
+        "Usa 'Adaptación al cambio climático' solo si el artículo menciona explícitamente cambio climático, adaptación, resiliencia, vulnerabilidad, riesgo climático o impactos climáticos.",
+        "Si el artículo trata materiales, síntesis, nanopartículas, concreto, adsorción, valorización de residuos o tecnologías limpias sin evidencia climática explícita, no uses 'Adaptación al cambio climático'.",
         "Evita decidir solo por palabras amplias si el título y el resumen apuntan a un tema más específico.",
     ]
 

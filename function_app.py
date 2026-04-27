@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 import unicodedata
 from datetime import datetime, timezone
 
@@ -49,6 +50,47 @@ def resolve_llm_enabled(request_value: str | None = None) -> bool:
     if request_value is not None and str(request_value).strip() != "":
         return parse_bool(request_value, default=False)
     return get_bool_setting("THEMATIC_LLM_ENABLED", default=False)
+
+
+def resolve_career_ambiguity_ai_enabled(request_value: str | None = None) -> bool:
+    """
+    Controla la IA SOLO para resolver carrera objetivo en casos ambiguos:
+    ULima + Facultad/Escuela de Ingeniería genérica, pero sin carrera explícita
+    Industrial/Civil/Sistemas.
+
+    Es independiente de THEMATIC_LLM_ENABLED para evitar activar LLM en todos
+    los campos temáticos y disparar costos/429.
+    """
+    if request_value is not None and str(request_value).strip() != "":
+        return parse_bool(request_value, default=False)
+    return get_bool_setting("CAREER_AMBIGUITY_LLM_ENABLED", default=False)
+
+
+def get_career_ambiguity_llm_min_confidence() -> float:
+    raw = os.environ.get("CAREER_AMBIGUITY_LLM_MIN_CONFIDENCE", "0.78")
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.78
+    return max(0.0, min(1.0, value))
+
+
+def get_openai_max_retries() -> int:
+    raw = os.environ.get("AZURE_OPENAI_MAX_RETRIES", "4")
+    try:
+        value = int(raw)
+    except Exception:
+        value = 4
+    return max(0, min(8, value))
+
+
+def get_openai_retry_base_seconds() -> float:
+    raw = os.environ.get("AZURE_OPENAI_RETRY_BASE_SECONDS", "2.0")
+    try:
+        value = float(raw)
+    except Exception:
+        value = 2.0
+    return max(0.25, min(30.0, value))
 
 
 def get_default_max_rows_per_run() -> int | None:
@@ -964,8 +1006,11 @@ def resolve_engineering_careers_from_affiliation_text(*values: str | None) -> li
 # =========================
 # GENERIC ENGINEERING CAREER INFERENCE
 # =========================
-CAREER_INFERENCE_MIN_SCORE = 5
-CAREER_INFERENCE_MIN_MARGIN = 2
+# Fallback heurístico conservador. Cuando career_ai=true, la IA decide los
+# casos ambiguos de Facultad de Ingeniería genérica. Si la IA está apagada,
+# estas constantes evitan rescates automáticos demasiado agresivos.
+CAREER_INFERENCE_MIN_SCORE = int(os.environ.get("CAREER_INFERENCE_MIN_SCORE", "12"))
+CAREER_INFERENCE_MIN_MARGIN = int(os.environ.get("CAREER_INFERENCE_MIN_MARGIN", "4"))
 
 CAREER_INFERENCE_SIGNALS = {
     "Ingeniería Industrial": [
@@ -1096,6 +1141,200 @@ def infer_target_career_from_generic_engineering_context(
     }
 
 
+def serialize_score_map_for_reason(score_map: dict[str, int] | None) -> str:
+    score_map = score_map or {}
+    return "; ".join(f"{career}={score_map.get(career, 0)}" for career in VALID_ENGINEERING_CAREERS)
+
+
+def build_generic_engineering_career_ai_prompt(
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+    authors_value: str | None,
+    ulima_docentes_value: str | None,
+    ulima_contexts: list[str] | None,
+    heuristic_score_map: dict[str, int] | None,
+) -> str:
+    """
+    Prompt especializado para decidir carrera objetivo SOLO en casos ambiguos:
+    ULima + Facultad/Escuela de Ingeniería genérica, sin carrera explícita.
+    """
+    payload = {
+        "task": "resolve_target_engineering_career_for_ulima_generic_engineering_affiliation",
+        "allowed_careers": VALID_ENGINEERING_CAREERS,
+        "allowed_decisions": ["ACCEPT", "REVIEW", "REJECT_NOT_TARGET"],
+        "article": {
+            "title": clip_text(title_value, 2200),
+            "abstract_scopus": clip_text(abstract_value, 9000),
+            "author_keywords": clip_text(author_keywords_value, 2500),
+            "index_keywords": clip_text(index_keywords_value, 2500),
+            "source_title": clip_text(source_title_value, 1200),
+            "authors": clip_text(authors_value, 2200),
+            "ulima_docentes_detected": clip_text(ulima_docentes_value, 2200),
+            "ulima_affiliation_contexts": [clip_text(x, 2500) for x in (ulima_contexts or [])],
+            "heuristic_scores": heuristic_score_map or {},
+        },
+        "output_schema": {
+            "decision": "ACCEPT|REVIEW|REJECT_NOT_TARGET",
+            "career": "Ingeniería Industrial|Ingeniería Civil|Ingeniería de Sistemas|null",
+            "confidence": "number 0..1",
+            "evidence_level": "explicit_affiliation|docente_ref|strong_thematic|weak_or_ambiguous|out_of_scope",
+            "rationale": "short Spanish explanation, max 35 words",
+            "red_flags": ["short strings"],
+        },
+        "rules": [
+            "El caso ya tiene afiliación real a Universidad de Lima y contexto genérico de Facultad/Escuela de Ingeniería, pero NO tiene carrera explícita.",
+            "Debes decidir si corresponde a una de estas carreras: Ingeniería Industrial, Ingeniería Civil o Ingeniería de Sistemas.",
+            "Usa el abstract como evidencia principal; usa título, keywords, source title, autores y afiliación como apoyo.",
+            "La frase 'Facultad de Ingeniería' o 'Faculty of Engineering' por sí sola NO basta para aceptar una carrera.",
+            "ACCEPT solo si hay evidencia temática fuerte y claramente dominante para una carrera.",
+            "REVIEW si la evidencia es débil, mixta, genérica, educativa, metodológica, estadística o no permite distinguir carrera con seguridad.",
+            "REJECT_NOT_TARGET si el artículo claramente pertenece a física, cosmología, medicina, arquitectura pura, educación general, diseño, química/materiales genéricos u otro campo sin vínculo defendible con Industrial/Civil/Sistemas.",
+            "Ingeniería Industrial: lean, 5S, TPM, SMED, SLP, warehouse, inventory, supply chain, logistics, production, operations, productivity, quality, safety/ergonomics, commercial/CRM/process improvement, plant feasibility.",
+            "Ingeniería Civil: BIM/VDC para construcción, structural/concrete/seismic/building/pavement/asphalt/geotechnics/water resources/drainage/hydraulics/construction/housing/infrastructure.",
+            "Ingeniería de Sistemas: machine learning/deep learning/computer vision/NLP/software engineering/cybersecurity/IoT/cloud/databases/algorithms/information systems. No uses Sistemas solo por decir digital/online/interface/education.",
+            "Si la mejor carrera y la segunda están muy cercanas, devuelve REVIEW, no ACCEPT.",
+            "Devuelve SOLO JSON válido, sin markdown. No inventes campos.",
+        ],
+    }
+    return (
+        "Eres un revisor académico senior de producción científica de la Facultad de Ingeniería de la Universidad de Lima. "
+        "Tu tarea es resolver carreras ambiguas con criterio conservador y auditable.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def call_openai_responses_json(prompt: str) -> dict | None:
+    if not is_thematic_llm_configured():
+        return None
+
+    max_retries = get_openai_max_retries()
+    base_seconds = get_openai_retry_base_seconds()
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            client = get_azure_openai_client()
+            response = client.responses.create(
+                model=get_env("AZURE_OPENAI_RESPONSES_MODEL"),
+                input=prompt,
+            )
+            return extract_json_object(getattr(response, "output_text", None))
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            retryable = any(token in message for token in ["429", "rate limit", "too many requests", "timeout", "temporarily", "503", "502"])
+            if attempt >= max_retries or not retryable:
+                break
+            sleep_seconds = min(60.0, base_seconds * (2 ** attempt))
+            logging.warning(
+                "Azure OpenAI retryable error on attempt %s/%s: %s. Sleeping %.1fs",
+                attempt + 1,
+                max_retries + 1,
+                str(exc),
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
+
+    logging.warning("Azure OpenAI JSON call failed after retries: %s", str(last_error) if last_error else "unknown")
+    return None
+
+
+def classify_generic_engineering_target_career_with_ai(
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+    authors_value: str | None,
+    ulima_docentes_value: str | None,
+    ulima_contexts: list[str] | None,
+    heuristic_score_map: dict[str, int] | None,
+) -> dict:
+    """
+    Usa IA solo para decidir carrera objetivo en afiliaciones ULima + Ingeniería genérica.
+    Resultado conservador: si no hay ACCEPT con confianza suficiente, queda para REVIEW.
+    """
+    empty = {
+        "careers": [],
+        "decision": "NO_AI_RESULT",
+        "confidence": None,
+        "reason": "NO_AI_RESULT",
+        "rationale": None,
+        "evidence_level": None,
+        "raw": None,
+    }
+
+    if not is_thematic_llm_configured():
+        empty["decision"] = "AI_NOT_CONFIGURED"
+        empty["reason"] = "AI_NOT_CONFIGURED"
+        return empty
+
+    prompt = build_generic_engineering_career_ai_prompt(
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+        authors_value=authors_value,
+        ulima_docentes_value=ulima_docentes_value,
+        ulima_contexts=ulima_contexts,
+        heuristic_score_map=heuristic_score_map,
+    )
+    raw_output = call_openai_responses_json(prompt)
+    if not raw_output:
+        empty["decision"] = "AI_FAILED_OR_NON_JSON"
+        empty["reason"] = "AI_FAILED_OR_NON_JSON"
+        return empty
+
+    decision = str(raw_output.get("decision") or "").strip().upper()
+    career = coerce_choice(raw_output.get("career"), VALID_ENGINEERING_CAREERS)
+    confidence = parse_float_or_none(raw_output.get("confidence"))
+    rationale = str(raw_output.get("rationale") or "").strip() or None
+    evidence_level = str(raw_output.get("evidence_level") or "").strip() or None
+
+    result = {
+        "careers": [],
+        "decision": decision or "INVALID_DECISION",
+        "confidence": confidence,
+        "reason": decision or "INVALID_DECISION",
+        "rationale": rationale,
+        "evidence_level": evidence_level,
+        "raw": raw_output,
+    }
+
+    min_confidence = get_career_ambiguity_llm_min_confidence()
+    if decision == "ACCEPT" and career and confidence is not None and confidence >= min_confidence:
+        result["careers"] = [career]
+        result["reason"] = "AI_ACCEPTED_TARGET_CAREER"
+        return result
+
+    if decision == "ACCEPT" and career:
+        result["reason"] = f"AI_LOW_CONFIDENCE_ACCEPT_BELOW_THRESHOLD_{min_confidence:.2f}"
+        return result
+
+    if decision in {"REVIEW", "REJECT_NOT_TARGET"}:
+        result["reason"] = f"AI_{decision}"
+        return result
+
+    result["reason"] = "AI_INVALID_OR_INCOMPLETE_OUTPUT"
+    return result
+
+
+def format_ai_review_reason(prefix: str, ai_result: dict, score_map: dict[str, int] | None) -> str:
+    confidence = ai_result.get("confidence")
+    confidence_text = "NULL" if confidence is None else f"{float(confidence):.2f}"
+    rationale = ai_result.get("rationale") or "No rationale returned"
+    evidence = ai_result.get("evidence_level") or "unknown"
+    return (
+        f"{prefix}: AI decision did not produce a safe accepted career. "
+        f"ai_reason={ai_result.get('reason')}; confidence={confidence_text}; evidence_level={evidence}; "
+        f"scores={serialize_score_map_for_reason(score_map)}; rationale={rationale[:500]}"
+    )
+
+
 def choose_primary_career_for_classification(carrera_raw: str | None, text_fields: dict[str, str]) -> str | None:
     """
     La publicación puede tener multicarrera en carrera_raw. Para no duplicar registros,
@@ -1126,6 +1365,8 @@ def determine_row_engineering_eligibility(
     author_keywords_value: str | None = None,
     index_keywords_value: str | None = None,
     source_title_value: str | None = None,
+    authors_value: str | None = None,
+    use_career_ai: bool = False,
 ) -> dict:
     """
     Determina si una fila Scopus debe pasar a curated.
@@ -1180,6 +1421,50 @@ def determine_row_engineering_eligibility(
             index_keywords_value=index_keywords_value,
             source_title_value=source_title_value,
         )
+        score_map = inferred.get("score_map") or {}
+
+        # IA especializada para los casos realmente ambiguos:
+        # ULima + Facultad/Escuela de Ingeniería genérica, sin Industrial/Civil/Sistemas explícito.
+        # Si la IA está activa, su decisión conservadora prevalece sobre el rescate heurístico.
+        if use_career_ai:
+            ai_result = classify_generic_engineering_target_career_with_ai(
+                title_value=title_value,
+                abstract_value=abstract_value,
+                author_keywords_value=author_keywords_value,
+                index_keywords_value=index_keywords_value,
+                source_title_value=source_title_value,
+                authors_value=authors_value,
+                ulima_docentes_value=enrichment.get("ulima_docentes_raw"),
+                ulima_contexts=affiliation_details.get("ulima_contexts"),
+                heuristic_score_map=score_map,
+            )
+            ai_careers = filter_valid_engineering_careers(ai_result.get("careers"))
+
+            if ai_careers:
+                method_suffix_map = {
+                    "Ingeniería Industrial": "INDUSTRIAL",
+                    "Ingeniería Civil": "CIVIL",
+                    "Ingeniería de Sistemas": "SISTEMAS",
+                }
+                inferred_method_suffix = "_".join(method_suffix_map.get(career, "UNKNOWN") for career in ai_careers)
+                return {
+                    "eligible": True,
+                    "carrera_raw": "; ".join(ai_careers),
+                    "reason": None,
+                    "metodo_cruce_scopus_raw": f"AFFIL_GENERIC_ENG_AI_{inferred_method_suffix}",
+                }
+
+            if ai_result.get("reason") not in {"AI_NOT_CONFIGURED", "AI_FAILED_OR_NON_JSON", "NO_AI_RESULT"}:
+                prefix = "REVIEW_ULIMA_ENGINEERING_AI_NO_TARGET_CAREER"
+                if ai_result.get("decision") == "REJECT_NOT_TARGET" or ai_result.get("reason") == "AI_REJECT_NOT_TARGET":
+                    prefix = "REJECT_ULIMA_ENGINEERING_AI_NOT_TARGET_CAREER"
+                return {
+                    "eligible": False,
+                    "carrera_raw": None,
+                    "reason": format_ai_review_reason(prefix, ai_result, score_map),
+                }
+            # Si la IA falló o no está configurada, continuar con fallback heurístico conservador.
+
         inferred_careers = filter_valid_engineering_careers(inferred.get("careers"))
 
         if inferred_careers:
@@ -1199,9 +1484,8 @@ def determine_row_engineering_eligibility(
                 "metodo_cruce_scopus_raw": f"AFFILIATION_GENERIC_ENGINEERING_INFERRED_{inferred_method_suffix}",
             }
 
-        score_map = inferred.get("score_map") or {}
         reason_detail = inferred.get("reason") or "NO_INFERENCE"
-        score_detail = "; ".join(f"{career}={score_map.get(career, 0)}" for career in VALID_ENGINEERING_CAREERS)
+        score_detail = serialize_score_map_for_reason(score_map)
         return {
             "eligible": False,
             "carrera_raw": None,
@@ -5406,7 +5690,7 @@ COLUMN_ALIASES = {
 }
 
 
-def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None = None) -> dict:
+def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None = None, use_career_ai: bool = False) -> dict:
     mapped = {}
 
     for target_column, aliases in COLUMN_ALIASES.items():
@@ -5494,6 +5778,8 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None
         author_keywords_value=mapped.get("author_keywords_raw"),
         index_keywords_value=mapped.get("index_keywords_raw"),
         source_title_value=mapped.get("source_title_raw"),
+        authors_value=mapped.get("authors_raw"),
+        use_career_ai=use_career_ai,
     )
 
     if eligibility.get("carrera_raw"):
@@ -5744,6 +6030,7 @@ def insert_rows_to_staging(
     docentes_ref: list[dict],
     source_row_start: int = 1,
     use_llm: bool | None = None,
+    use_career_ai: bool = False,
 ) -> tuple[int, int, list[tuple[int, dict]]]:
     """
     Inserta SOLO filas válidas en staging antes del upsert y devuelve rechazados en memoria.
@@ -5763,7 +6050,7 @@ def insert_rows_to_staging(
         cursor = conn.cursor()
 
         for idx, row in enumerate(rows, start=source_row_start):
-            mapped = map_row_to_staging(row, docentes_ref=docentes_ref, use_llm=use_llm)
+            mapped = map_row_to_staging(row, docentes_ref=docentes_ref, use_llm=use_llm, use_career_ai=use_career_ai)
 
             if mapped.get("is_valid_for_curated") == 1 and not mapped.get("__skip_insert__"):
                 insert_scopus_raw_load_row(cursor, run_id, source_file_name, idx, mapped)
@@ -5831,12 +6118,15 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "containers": container_status,
             "thematic_llm_configured": is_thematic_llm_configured(),
             "thematic_llm_enabled": resolve_llm_enabled(),
+            "career_ambiguity_ai_configured": is_thematic_llm_configured(),
+            "career_ambiguity_ai_enabled": resolve_career_ambiguity_ai_enabled(),
+            "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
             "scopus_max_rows_per_run": get_default_max_rows_per_run(),
             "save_rejected_to_staging_default": resolve_save_rejected_enabled(),
             "engineering_generic_inference_enabled": True,
             "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
             "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
-            "classification_guardrails_version": "v2_run69_quality_patch",
+            "classification_guardrails_version": "v3_run70_career_ai_patch",
             "post_upsert_reactivation_enabled": True,
         }
 
@@ -6015,6 +6305,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         end_row = parse_positive_int(req.params.get("end_row"), "end_row")
         max_rows = parse_positive_int(req.params.get("max_rows"), "max_rows")
         use_llm = resolve_llm_enabled(req.params.get("llm"))
+        use_career_ai = resolve_career_ambiguity_ai_enabled(req.params.get("career_ai"))
         save_rejected_to_staging = resolve_save_rejected_enabled(req.params.get("save_rejected"))
 
         run_id = create_pipeline_run(
@@ -6043,6 +6334,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             docentes_ref=docentes_ref,
             source_row_start=effective_start_row,
             use_llm=use_llm,
+            use_career_ai=use_career_ai,
         )
 
         execute_upsert_from_staging(run_id)
@@ -6077,6 +6369,8 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             "records_reactivated_in_curated": records_reactivated_in_curated,
             "save_rejected_to_staging": save_rejected_to_staging,
             "thematic_llm_enabled": use_llm,
+            "career_ambiguity_ai_enabled": use_career_ai,
+            "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
             "utc_now": utc_now_iso(),
             "status": "SUCCESS",
         }
@@ -6113,6 +6407,8 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
                     "records_rejected_saved_to_staging": records_rejected_saved_to_staging,
                     "save_rejected_to_staging": save_rejected_to_staging,
                     "thematic_llm_enabled": use_llm,
+                    "career_ambiguity_ai_enabled": use_career_ai,
+                    "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
                     "utc_now": utc_now_iso(),
                 },
                 ensure_ascii=False,

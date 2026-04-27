@@ -93,6 +93,135 @@ def get_openai_retry_base_seconds() -> float:
     return max(0.25, min(30.0, value))
 
 
+def parse_nonnegative_float(value: str | None, default: float = 0.0) -> float:
+    if value is None or str(value).strip() == "":
+        return default
+    try:
+        parsed = float(str(value).strip())
+    except Exception:
+        return default
+    return max(0.0, parsed)
+
+
+def parse_optional_positive_int_setting(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        parsed = int(str(raw).strip())
+    except Exception:
+        return None
+    return parsed if parsed >= 1 else None
+
+
+def get_career_ai_call_delay_seconds() -> float:
+    """
+    Pausa entre llamadas exitosas a Azure OpenAI para carrera ambigua.
+
+    El run con career_ai=true puede generar muchas llamadas seguidas a /responses;
+    sin throttling aparecen 429 constantes aunque el SDK reintente.
+    Default conservador: 3.5 segundos.
+    """
+    raw = os.environ.get("CAREER_AI_CALL_DELAY_SECONDS")
+    if raw is None or str(raw).strip() == "":
+        raw = os.environ.get("AZURE_OPENAI_CALL_DELAY_SECONDS", "3.5")
+    return min(60.0, parse_nonnegative_float(raw, default=3.5))
+
+
+def get_career_ai_max_calls_per_run() -> int | None:
+    """Límite opcional para evitar timeouts/costos en corridas masivas."""
+    return parse_optional_positive_int_setting("CAREER_AI_MAX_CALLS_PER_RUN")
+
+
+def get_career_ai_throttle_after_429_seconds() -> float:
+    raw = os.environ.get("CAREER_AI_EXTRA_SLEEP_AFTER_429_SECONDS", "8.0")
+    return min(120.0, parse_nonnegative_float(raw, default=8.0))
+
+
+_LAST_AZURE_OPENAI_CALL_AT = 0.0
+_CAREER_AI_CALLS_THIS_RUN = 0
+
+
+def reset_ai_runtime_counters() -> None:
+    global _CAREER_AI_CALLS_THIS_RUN
+    _CAREER_AI_CALLS_THIS_RUN = 0
+
+
+def get_career_ai_calls_this_run() -> int:
+    return int(_CAREER_AI_CALLS_THIS_RUN)
+
+
+def reserve_career_ai_call_slot() -> dict:
+    """
+    Reserva una llamada IA para el run actual.
+    Si CAREER_AI_MAX_CALLS_PER_RUN se supera, el caso se manda a REVIEW
+    en lugar de seguir saturando Azure OpenAI.
+    """
+    global _CAREER_AI_CALLS_THIS_RUN
+
+    max_calls = get_career_ai_max_calls_per_run()
+    if max_calls is not None and _CAREER_AI_CALLS_THIS_RUN >= max_calls:
+        return {
+            "allowed": False,
+            "calls_used": _CAREER_AI_CALLS_THIS_RUN,
+            "max_calls": max_calls,
+        }
+
+    _CAREER_AI_CALLS_THIS_RUN += 1
+    return {
+        "allowed": True,
+        "calls_used": _CAREER_AI_CALLS_THIS_RUN,
+        "max_calls": max_calls,
+    }
+
+
+def throttle_azure_openai_call(delay_seconds: float, label: str = "azure_openai") -> None:
+    """
+    Throttle global simple dentro del worker. Evita ráfagas de requests a /responses.
+    No intenta paralelizar: prioriza estabilidad del pipeline sobre velocidad.
+    """
+    global _LAST_AZURE_OPENAI_CALL_AT
+
+    delay_seconds = max(0.0, float(delay_seconds or 0.0))
+    if delay_seconds <= 0:
+        _LAST_AZURE_OPENAI_CALL_AT = time.monotonic()
+        return
+
+    now = time.monotonic()
+    if _LAST_AZURE_OPENAI_CALL_AT > 0:
+        elapsed = now - _LAST_AZURE_OPENAI_CALL_AT
+        remaining = delay_seconds - elapsed
+        if remaining > 0:
+            logging.info("Throttling %s Azure OpenAI call for %.2fs", label, remaining)
+            time.sleep(remaining)
+
+    _LAST_AZURE_OPENAI_CALL_AT = time.monotonic()
+
+
+def extract_retry_after_seconds_from_exception(exc: Exception) -> float | None:
+    """Intenta leer Retry-After / retry-after-ms de una excepción OpenAI/Azure."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None) if response is not None else None
+    if not headers:
+        return None
+
+    try:
+        retry_ms = headers.get("retry-after-ms") or headers.get("x-ms-retry-after-ms")
+        if retry_ms:
+            return max(0.0, float(retry_ms) / 1000.0)
+    except Exception:
+        pass
+
+    try:
+        retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        if retry_after:
+            return max(0.0, float(retry_after))
+    except Exception:
+        pass
+
+    return None
+
+
 def get_default_max_rows_per_run() -> int | None:
     return parse_positive_int(os.environ.get("SCOPUS_MAX_ROWS_PER_RUN"), "SCOPUS_MAX_ROWS_PER_RUN")
 
@@ -1284,7 +1413,11 @@ def build_generic_engineering_career_ai_prompt(
     )
 
 
-def call_openai_responses_json(prompt: str) -> dict | None:
+def call_openai_responses_json(
+    prompt: str,
+    throttle_seconds: float = 0.0,
+    call_label: str = "azure_openai",
+) -> dict | None:
     if not is_thematic_llm_configured():
         return None
 
@@ -1294,6 +1427,8 @@ def call_openai_responses_json(prompt: str) -> dict | None:
 
     for attempt in range(max_retries + 1):
         try:
+            throttle_azure_openai_call(throttle_seconds, label=call_label)
+
             client = get_azure_openai_client()
             response = client.responses.create(
                 model=get_env("AZURE_OPENAI_RESPONSES_MODEL"),
@@ -1303,12 +1438,25 @@ def call_openai_responses_json(prompt: str) -> dict | None:
         except Exception as exc:
             last_error = exc
             message = str(exc).lower()
-            retryable = any(token in message for token in ["429", "rate limit", "too many requests", "timeout", "temporarily", "503", "502"])
+            retryable = any(
+                token in message
+                for token in ["429", "rate limit", "too many requests", "timeout", "temporarily", "503", "502"]
+            )
             if attempt >= max_retries or not retryable:
                 break
-            sleep_seconds = min(60.0, base_seconds * (2 ** attempt))
+
+            retry_after = extract_retry_after_seconds_from_exception(exc)
+            if retry_after is not None:
+                sleep_seconds = min(120.0, retry_after + 1.0)
+            else:
+                sleep_seconds = min(120.0, base_seconds * (2 ** attempt))
+
+            if "429" in message or "rate limit" in message or "too many requests" in message:
+                sleep_seconds = max(sleep_seconds, get_career_ai_throttle_after_429_seconds())
+
             logging.warning(
-                "Azure OpenAI retryable error on attempt %s/%s: %s. Sleeping %.1fs",
+                "Azure OpenAI retryable error for %s on attempt %s/%s: %s. Sleeping %.1fs",
+                call_label,
                 attempt + 1,
                 max_retries + 1,
                 str(exc),
@@ -1316,7 +1464,11 @@ def call_openai_responses_json(prompt: str) -> dict | None:
             )
             time.sleep(sleep_seconds)
 
-    logging.warning("Azure OpenAI JSON call failed after retries: %s", str(last_error) if last_error else "unknown")
+    logging.warning(
+        "Azure OpenAI JSON call failed for %s after retries: %s",
+        call_label,
+        str(last_error) if last_error else "unknown",
+    )
     return None
 
 
@@ -1350,6 +1502,14 @@ def classify_generic_engineering_target_career_with_ai(
         empty["reason"] = "AI_NOT_CONFIGURED"
         return empty
 
+    call_slot = reserve_career_ai_call_slot()
+    if not call_slot.get("allowed"):
+        empty["decision"] = "AI_SKIPPED_MAX_CALLS_PER_RUN"
+        empty["reason"] = (
+            f"AI_SKIPPED_MAX_CALLS_PER_RUN_{call_slot.get('calls_used')}_OF_{call_slot.get('max_calls')}"
+        )
+        return empty
+
     prompt = build_generic_engineering_career_ai_prompt(
         title_value=title_value,
         abstract_value=abstract_value,
@@ -1361,7 +1521,11 @@ def classify_generic_engineering_target_career_with_ai(
         ulima_contexts=ulima_contexts,
         heuristic_score_map=heuristic_score_map,
     )
-    raw_output = call_openai_responses_json(prompt)
+    raw_output = call_openai_responses_json(
+        prompt,
+        throttle_seconds=get_career_ai_call_delay_seconds(),
+        call_label="career_ambiguity_ai",
+    )
     if not raw_output:
         empty["decision"] = "AI_FAILED_OR_NON_JSON"
         empty["reason"] = "AI_FAILED_OR_NON_JSON"
@@ -6348,12 +6512,17 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "career_ambiguity_ai_configured": is_thematic_llm_configured(),
             "career_ambiguity_ai_enabled": resolve_career_ambiguity_ai_enabled(),
             "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
+            "career_ai_call_delay_seconds": get_career_ai_call_delay_seconds(),
+            "career_ai_max_calls_per_run": get_career_ai_max_calls_per_run(),
+            "azure_openai_max_retries": get_openai_max_retries(),
+            "azure_openai_retry_base_seconds": get_openai_retry_base_seconds(),
+            "career_ai_extra_sleep_after_429_seconds": get_career_ai_throttle_after_429_seconds(),
             "scopus_max_rows_per_run": get_default_max_rows_per_run(),
             "save_rejected_to_staging_default": resolve_save_rejected_enabled(),
             "engineering_generic_inference_enabled": True,
             "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
             "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
-            "classification_guardrails_version": "v4_run71_career_ai_activation_and_safe_generic_patch",
+            "classification_guardrails_version": "v5_run72_career_ai_throttle_and_rate_limit_patch",
             "post_upsert_reactivation_enabled": True,
         }
 
@@ -6550,6 +6719,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         use_career_ai = resolve_career_ambiguity_ai_enabled(career_ai_value)
         save_rejected_to_staging = resolve_save_rejected_enabled(save_rejected_value)
 
+        reset_ai_runtime_counters()
         validate_career_ai_runtime_configuration(use_career_ai)
 
         run_id = create_pipeline_run(
@@ -6617,6 +6787,12 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             "career_ambiguity_ai_requested_value": career_ai_value,
             "career_ambiguity_ai_configured": is_thematic_llm_configured(),
             "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
+            "career_ai_call_delay_seconds": get_career_ai_call_delay_seconds(),
+            "career_ai_max_calls_per_run": get_career_ai_max_calls_per_run(),
+            "career_ai_calls_this_run": get_career_ai_calls_this_run(),
+            "azure_openai_max_retries": get_openai_max_retries(),
+            "azure_openai_retry_base_seconds": get_openai_retry_base_seconds(),
+            "career_ai_extra_sleep_after_429_seconds": get_career_ai_throttle_after_429_seconds(),
             "utc_now": utc_now_iso(),
             "status": "SUCCESS",
         }
@@ -6655,6 +6831,12 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
                     "thematic_llm_enabled": use_llm,
                     "career_ambiguity_ai_enabled": use_career_ai,
                     "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
+                    "career_ai_call_delay_seconds": get_career_ai_call_delay_seconds(),
+                    "career_ai_max_calls_per_run": get_career_ai_max_calls_per_run(),
+                    "career_ai_calls_this_run": get_career_ai_calls_this_run(),
+                    "azure_openai_max_retries": get_openai_max_retries(),
+                    "azure_openai_retry_base_seconds": get_openai_retry_base_seconds(),
+                    "career_ai_extra_sleep_after_429_seconds": get_career_ai_throttle_after_429_seconds(),
                     "utc_now": utc_now_iso(),
                 },
                 ensure_ascii=False,

@@ -1153,6 +1153,7 @@ def determine_row_engineering_eligibility(
             "eligible": True,
             "carrera_raw": "; ".join(careers_from_enrichment),
             "reason": None,
+            "metodo_cruce_scopus_raw": enrichment.get("metodo_cruce_scopus_raw") or "AFFILIATION_EXPLICIT_CAREER",
         }
 
     affiliation_details = resolve_engineering_affiliation_details(
@@ -1168,6 +1169,7 @@ def determine_row_engineering_eligibility(
             "eligible": True,
             "carrera_raw": "; ".join(careers_from_affiliation),
             "reason": None,
+            "metodo_cruce_scopus_raw": "AFFILIATION_EXPLICIT_CAREER",
         }
 
     if has_engineering_context and not careers_from_affiliation:
@@ -1181,10 +1183,20 @@ def determine_row_engineering_eligibility(
         inferred_careers = filter_valid_engineering_careers(inferred.get("careers"))
 
         if inferred_careers:
+            method_suffix_map = {
+                "Ingeniería Industrial": "INDUSTRIAL",
+                "Ingeniería Civil": "CIVIL",
+                "Ingeniería de Sistemas": "SISTEMAS",
+            }
+            inferred_method_suffix = "_".join(
+                method_suffix_map.get(career, normalize_generic_text(career).replace("ingenieria ", "").replace(" ", "_").upper())
+                for career in inferred_careers
+            )
             return {
                 "eligible": True,
                 "carrera_raw": "; ".join(inferred_careers),
                 "reason": None,
+                "metodo_cruce_scopus_raw": f"AFFILIATION_GENERIC_ENGINEERING_INFERRED_{inferred_method_suffix}",
             }
 
         score_map = inferred.get("score_map") or {}
@@ -2488,6 +2500,192 @@ IDIC_EMERGING_TECH_STRONG_SIGNALS = [
     "novel derivatives",
 ]
 
+# =========================
+# PATCH GUARDRAILS V2 — curated classification quality
+# =========================
+CIVIL_STRUCTURAL_STRONG_SIGNALS = [
+    "structural", "structure", "structures", "beam", "beams", "column", "columns",
+    "cyclic loading", "reversed cyclic", "reinforced concrete", "fiber reinforced concrete",
+    "fibre reinforced concrete", "concrete", "masonry", "seismic", "earthquake",
+    "stiffness", "ductility", "modal analysis", "hysteretic", "vulnerability",
+    "self built housing", "self-built housing", "structural degradation",
+]
+
+CIVIL_CONSTRUCTION_MATERIALS_STRONG_SIGNALS = [
+    "construction materials", "materiales de construccion", "self compacting concrete",
+    "self-compacting concrete", "high performance concrete", "high-strength concrete",
+    "heat of hydration", "hydration heat", "mass concrete", "massive concrete",
+    "polypropylene fibers", "cement", "mortar", "aggregate", "construction material",
+]
+
+CIVIL_BIM_VDC_STRONG_SIGNALS = [
+    "bim", "building information modelling", "building information modeling",
+    "hbim", "historic building information modeling", "historic building information modelling",
+    "vdc", "virtual design and construction", "digital twin", "digital twins",
+    "point cloud", "uav", "gnss", "photogrammetry", "geomatic", "dynamo",
+]
+
+CIVIL_WATER_STRONG_SIGNALS = [
+    "water quality", "calidad del agua", "hydrology", "hydraulic", "hydraulics",
+    "water resources", "recursos hidricos", "drainage", "irrigation", "groundwater",
+    "hydrogeology", "aquifer", "river", "sediment transport", "rainfall", "flood",
+    "wastewater", "arsenic", "pollutant", "contaminant", "adsorption", "water treatment",
+]
+
+CIVIL_TRANSPORT_GEOTECH_STRONG_SIGNALS = [
+    "asphalt", "pavement", "stone mastic asphalt", "sma", "road", "soil", "geotechnical",
+    "geotechnics", "rock mechanics", "slope", "stabilization", "transport infrastructure",
+]
+
+SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS = [
+    "computer vision", "vision computacional", "image enhancement", "image processing",
+    "object detection", "human detection", "activity recognition", "keypoint detection",
+    "homography", "monocular video", "surveillance camera", "surveillance cameras",
+    "yolo", "gan", "generative adversarial", "low light", "low-light", "image",
+    "images", "video", "pose", "detection",
+]
+
+SYSTEMS_ML_STRONG_SIGNALS = [
+    "machine learning", "deep learning", "aprendizaje automatico", "classification",
+    "classifier", "predictive model", "predictive models", "xgboost", "lightgbm",
+    "catboost", "random forest", "neural network", "neural networks", "lstm",
+    "cnn", "transformer", "data mining", "clustering",
+]
+
+SYSTEMS_CYBER_STRONG_SIGNALS = [
+    "cybersecurity", "ciberseguridad", "ddos", "botnet", "malware", "phishing",
+    "intrusion detection", "network security", "application security", "security of systems",
+    "seguridad de sistemas", "seguridad de aplicaciones",
+]
+
+SYSTEMS_GAME_STRONG_SIGNALS = [
+    "serious game", "serious games", "gamification", "gamificacion", "game-based",
+    "game based", "game", "games", "video game", "videogame", "juegos",
+]
+
+SYSTEMS_ARVR_STRONG_SIGNALS = [
+    "augmented reality", "virtual reality", "mixed reality", "realidad aumentada",
+    "realidad virtual", "ar platform", "vr", "ar",
+]
+
+SYSTEMS_AGENT_STRONG_SIGNALS = [
+    "virtual agent", "virtual agents", "agente virtual", "agentes virtuales",
+    "chatbot", "chatbots", "conversational agent", "conversational agents",
+    "assistant", "avatar", "human agent interaction",
+]
+
+SYSTEMS_SOFTWARE_STRONG_SIGNALS = [
+    "software engineering", "ingenieria de software", "software architecture",
+    "clean architecture", "mobile application", "android application", "web application",
+    "application", "app", "platform", "database", "information system", "information systems",
+]
+
+SYSTEMS_GENDER_TECH_STRONG_SIGNALS = [
+    "women in stem", "gender gap", "gender stereotypes", "stem", "it-related programs",
+    "information technology-related programs", "girls", "leadership in stem",
+]
+
+INDUSTRIAL_EXTENDED_STRONG_SIGNALS = [
+    "business management", "business process management", "competitiveness",
+    "commercial model", "sales", "crm", "lead handling", "demand management",
+    "operational management", "production plant", "plant capacity", "technological feasibility",
+    "occupational risk", "occupational risks", "safety rules", "service model", "nps",
+    "retail", "commercial sector", "forecasting", "profile standardization", "poka yoke",
+    "queueing", "workload balancing", "yamazumi", "jit", "rop", "ddmrp", "heijunka",
+    "six sigma", "sweep method", "value stream mapping", "vsm",
+]
+
+CHEM_MATERIAL_PRODUCT_STRONG_SIGNALS = [
+    "synthesis", "green synthesis", "chemical synthesis", "characterization",
+    "computational characterization", "dft", "density functional theory", "molecular docking",
+    "molecular dynamics", "metabolites", "secondary metabolites", "hplc", "uhplc",
+    "mass spectrometry", "orbitrap", "compound", "compounds", "derivatives",
+    "antitubercular", "isoniazid", "hydrazone", "phenylpyrazole", "cellulose",
+    "nanofibers", "nanofibres", "nanocellulose", "chitosan", "films", "biopolymer",
+    "activated carbon", "adsorption", "photoelectrocatalysis", "electrode", "photoanode",
+]
+
+
+
+# Extensiones de scoring activadas para el run posterior al 68.
+CAREER_INFERENCE_SIGNALS["Ingeniería Industrial"].extend(
+    INDUSTRIAL_EXTENDED_STRONG_SIGNALS + CHEM_MATERIAL_PRODUCT_STRONG_SIGNALS
+)
+CAREER_INFERENCE_SIGNALS["Ingeniería Civil"].extend(
+    CIVIL_STRUCTURAL_STRONG_SIGNALS
+    + CIVIL_CONSTRUCTION_MATERIALS_STRONG_SIGNALS
+    + CIVIL_BIM_VDC_STRONG_SIGNALS
+    + CIVIL_WATER_STRONG_SIGNALS
+    + CIVIL_TRANSPORT_GEOTECH_STRONG_SIGNALS
+)
+CAREER_INFERENCE_SIGNALS["Ingeniería de Sistemas"].extend(
+    SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS
+    + SYSTEMS_ML_STRONG_SIGNALS
+    + SYSTEMS_CYBER_STRONG_SIGNALS
+    + SYSTEMS_GAME_STRONG_SIGNALS
+    + SYSTEMS_ARVR_STRONG_SIGNALS
+    + SYSTEMS_AGENT_STRONG_SIGNALS
+    + SYSTEMS_SOFTWARE_STRONG_SIGNALS
+    + SYSTEMS_GENDER_TECH_STRONG_SIGNALS
+)
+
+CAREER_LINE_HINTS["Ingeniería Industrial"]["Planeamiento y Gestión de Operaciones"].extend(
+    INDUSTRIAL_EXTENDED_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería Industrial"]["Desarrollo de producto"].extend(
+    CHEM_MATERIAL_PRODUCT_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería Industrial"]["Diseño y desarrollo de modelos para el análisis y predicción de las variables de un proceso"].extend(
+    ["forecasting", "demand forecasting", "predictive analytics", "regression", "classification"]
+)
+
+CAREER_LINE_HINTS["Ingeniería Civil"]["Técnicas de experimentación en estructuras"].extend(
+    CIVIL_STRUCTURAL_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería Civil"]["Materiales de Construcción"].extend(
+    CIVIL_CONSTRUCTION_MATERIALS_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería Civil"]["Metodología BIM"].extend(
+    CIVIL_BIM_VDC_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería Civil"]["Calidad del Agua"].extend(
+    ["water treatment", "arsenic", "pollutant", "contaminant", "adsorption", "wastewater"]
+)
+
+CAREER_LINE_HINTS["Ingeniería de Sistemas"]["Visión computacional"].extend(
+    SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería de Sistemas"]["Aprendizaje automático"].extend(
+    SYSTEMS_ML_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería de Sistemas"]["Redes y ciberseguridad"].extend(
+    SYSTEMS_CYBER_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería de Sistemas"]["Construcción de juegos y gamificación"].extend(
+    SYSTEMS_GAME_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería de Sistemas"]["Realidad virtual y aumentada"].extend(
+    SYSTEMS_ARVR_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería de Sistemas"]["Agentes virtuales"].extend(
+    SYSTEMS_AGENT_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería de Sistemas"]["Ingeniería de software"].extend(
+    SYSTEMS_SOFTWARE_STRONG_SIGNALS
+)
+CAREER_LINE_HINTS["Ingeniería de Sistemas"]["Liderazgo, género y tecnología"].extend(
+    SYSTEMS_GENDER_TECH_STRONG_SIGNALS
+)
+
+IDIC_LINE_HINTS["Visión computacional"].extend(SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS)
+IDIC_LINE_HINTS["Machine learning y deep learning"].extend(SYSTEMS_ML_STRONG_SIGNALS)
+IDIC_LINE_HINTS["Ciberseguridad y privacidad"].extend(SYSTEMS_CYBER_STRONG_SIGNALS)
+IDIC_LINE_HINTS["Realidad virtual y aumentada"].extend(SYSTEMS_ARVR_STRONG_SIGNALS)
+IDIC_LINE_HINTS["Gestión de la innovación"].extend(INDUSTRIAL_EXTENDED_STRONG_SIGNALS)
+IDIC_LINE_HINTS["Materiales avanzados"].extend(CHEM_MATERIAL_PRODUCT_STRONG_SIGNALS)
+IDIC_LINE_HINTS["Gestión de residuos"].extend(["arsenic", "water treatment", "pollutant", "contaminant", "photoelectrocatalysis", "adsorption"])
+
+
 
 def contains_any_phrase_in_text_fields(text_fields: dict[str, str], phrases: list[str]) -> bool:
     for phrase in phrases:
@@ -2626,6 +2824,145 @@ def choose_best_line_with_rules(
 
 
 
+
+
+def career_fallback_from_domain_rules(
+    carrera: str,
+    text_fields: dict[str, str],
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Fallback de carrera controlado por dominio.
+
+    Evita que el fallback alfabético mande Civil a 'Calidad del Agua' o Sistemas
+    a 'Agentes virtuales' cuando no existe evidencia real para esas líneas.
+    """
+    if carrera == "Ingeniería Civil":
+        if contains_any_phrase_in_text_fields(text_fields, CIVIL_BIM_VDC_STRONG_SIGNALS):
+            return "Construcción", "Metodología BIM", "career_guardrail_civil_bim"
+
+        if contains_any_phrase_in_text_fields(text_fields, CIVIL_STRUCTURAL_STRONG_SIGNALS):
+            return "Estructuras", "Técnicas de experimentación en estructuras", "career_guardrail_civil_structures"
+
+        if contains_any_phrase_in_text_fields(text_fields, CIVIL_CONSTRUCTION_MATERIALS_STRONG_SIGNALS):
+            return "Construcción", "Materiales de Construcción", "career_guardrail_civil_construction_materials"
+
+        if contains_any_phrase_in_text_fields(text_fields, CIVIL_TRANSPORT_GEOTECH_STRONG_SIGNALS):
+            if contains_any_phrase_in_text_fields(text_fields, ["pavement", "pavimento"]):
+                return "Transporte y Geotecnia", "Diseño estructural de Pavimentos", "career_guardrail_civil_pavements"
+            if contains_any_phrase_in_text_fields(text_fields, ["asphalt", "stone mastic asphalt", "sma"]):
+                return "Transporte y Geotecnia", "Tecnologia de mezclas asfalticas", "career_guardrail_civil_asphalt"
+            return "Transporte y Geotecnia", "Geotecnia experimental", "career_guardrail_civil_geotech"
+
+        if contains_any_phrase_in_text_fields(text_fields, CIVIL_WATER_STRONG_SIGNALS):
+            if contains_any_phrase_in_text_fields(text_fields, ["drainage", "irrigation", "riego", "drenaje"]):
+                return "Hidráulica", "Riego y Drenaje", "career_guardrail_civil_drainage_irrigation"
+            if contains_any_phrase_in_text_fields(text_fields, ["hydrogeology", "groundwater", "aquifer", "hidrogeologia"]):
+                return "Hidráulica", "Hidrogeología", "career_guardrail_civil_hydrogeology"
+            if contains_any_phrase_in_text_fields(text_fields, ["water quality", "calidad del agua", "water treatment", "arsenic", "pollutant", "contaminant", "adsorption"]):
+                return "Hidráulica", "Calidad del Agua", "career_guardrail_civil_water_quality"
+            return "Hidráulica", "Hidrología e Hidráulica", "career_guardrail_civil_hydraulics"
+
+        if contains_any_phrase_in_text_fields(text_fields, ["urban regeneration", "informal settlement", "informal settlements", "sustainable urban", "housing"]):
+            return "Construcción", "Sostenibilidad", "career_guardrail_civil_sustainability"
+
+        # Fallback seguro de Civil: evita 'Calidad del Agua' sin evidencia hídrica.
+        return "Construcción", "Sostenibilidad", "career_guardrail_civil_safe_default"
+
+    if carrera == "Ingeniería de Sistemas":
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS):
+            return "Aplicaciones en inteligencia artificial", "Visión computacional", "career_guardrail_systems_computer_vision"
+
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_CYBER_STRONG_SIGNALS):
+            return "Sistemas de Tecnologías de Información (TI)", "Redes y ciberseguridad", "career_guardrail_systems_cybersecurity"
+
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ARVR_STRONG_SIGNALS):
+            return "Interacción humano-computadora", "Realidad virtual y aumentada", "career_guardrail_systems_arvr"
+
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_GAME_STRONG_SIGNALS):
+            return "Interacción humano-computadora", "Construcción de juegos y gamificación", "career_guardrail_systems_games"
+
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_AGENT_STRONG_SIGNALS):
+            return "Interacción humano-computadora", "Agentes virtuales", "career_guardrail_systems_virtual_agents"
+
+        if contains_any_phrase_in_text_fields(text_fields, ["nlp", "natural language processing", "large language model", "llm"]):
+            return "Aplicaciones en inteligencia artificial", "NLP", "career_guardrail_systems_nlp"
+
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ML_STRONG_SIGNALS):
+            return "Aplicaciones en inteligencia artificial", "Aprendizaje automático", "career_guardrail_systems_machine_learning"
+
+        if contains_any_phrase_in_text_fields(text_fields, ["iot", "internet of things"]):
+            return "Sistemas de Tecnologías de Información (TI)", "IoT", "career_guardrail_systems_iot"
+
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_SOFTWARE_STRONG_SIGNALS):
+            return "Algoritmos y sistemas computacionales", "Ingeniería de software", "career_guardrail_systems_software"
+
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_GENDER_TECH_STRONG_SIGNALS):
+            return "Tecnologías y gestión de la información", "Liderazgo, género y tecnología", "career_guardrail_systems_gender_tech"
+
+        # Fallback seguro de Sistemas: evita 'Agentes virtuales' sin evidencia.
+        return "Tecnologías y gestión de la información", "Computación aplicada", "career_guardrail_systems_safe_default"
+
+    if carrera == "Ingeniería Industrial":
+        if contains_any_phrase_in_text_fields(text_fields, CHEM_MATERIAL_PRODUCT_STRONG_SIGNALS):
+            return "Product Design & Development", "Desarrollo de producto", "career_guardrail_industrial_product_development_chem_materials"
+
+        if contains_any_phrase_in_text_fields(text_fields, INDUSTRIAL_SCM_STRONG_SIGNALS):
+            if contains_any_phrase_in_text_fields(text_fields, ["supply chain", "cadena de suministro"]):
+                return "Supply Chain Management", "Gestión de la cadena de suministro", "career_guardrail_industrial_supply_chain"
+            return "Supply Chain Management", "Gestión de Inventarios, Almacenes y Transportes", "career_guardrail_industrial_inventory_warehouse"
+
+        if contains_any_phrase_in_text_fields(text_fields, INDUSTRIAL_OEM_STRONG_SIGNALS + INDUSTRIAL_EXTENDED_STRONG_SIGNALS):
+            return "Operations Engineering & Management", "Planeamiento y Gestión de Operaciones", "career_guardrail_industrial_operations"
+
+        if contains_any_phrase_in_text_fields(text_fields, INDUSTRIAL_ORA_STRONG_SIGNALS):
+            return "Operations Research & Analysis", "Diseño y desarrollo de modelos para el análisis y predicción de las variables de un proceso", "career_guardrail_industrial_ora"
+
+        return "Operations Engineering & Management", "Planeamiento y Gestión de Operaciones", "career_guardrail_industrial_safe_default"
+
+    return None, None, None
+
+
+def apply_final_career_guardrails(
+    carrera: str | None,
+    area_carrera: str | None,
+    linea_carrera: str | None,
+    text_fields: dict[str, str],
+) -> tuple[str | None, str | None, str | None]:
+    """
+    Corrige clasificaciones de carrera que son formalmente válidas pero semánticamente
+    engañosas para los patrones observados en la carga Scopus ULima.
+    """
+    if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
+        return area_carrera, linea_carrera, None
+
+    fallback_area, fallback_line, fallback_source = career_fallback_from_domain_rules(carrera, text_fields)
+
+    if carrera == "Ingeniería Civil":
+        if linea_carrera == "Calidad del Agua" and not contains_any_phrase_in_text_fields(text_fields, CIVIL_WATER_STRONG_SIGNALS):
+            return fallback_area, fallback_line, fallback_source or "career_guardrail_civil_no_water_evidence"
+
+        if linea_carrera in ("Hidrología e Hidráulica", "Riego y Drenaje", "Hidrogeología", "Transporte de Sedimentos") and not contains_any_phrase_in_text_fields(text_fields, CIVIL_WATER_STRONG_SIGNALS):
+            return fallback_area, fallback_line, fallback_source or "career_guardrail_civil_no_hydraulic_evidence"
+
+    if carrera == "Ingeniería de Sistemas":
+        if linea_carrera == "Agentes virtuales" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_AGENT_STRONG_SIGNALS):
+            return fallback_area, fallback_line, fallback_source or "career_guardrail_systems_no_agent_evidence"
+
+        if linea_carrera == "Redes y ciberseguridad":
+            cyber_present = contains_any_phrase_in_text_fields(text_fields, SYSTEMS_CYBER_STRONG_SIGNALS)
+            vision_present = contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS)
+            if vision_present and not cyber_present:
+                return "Aplicaciones en inteligencia artificial", "Visión computacional", "career_guardrail_systems_vision_over_security"
+
+    if carrera == "Ingeniería Industrial":
+        if area_carrera == "Operations Research & Analysis" and contains_any_phrase_in_text_fields(text_fields, CHEM_MATERIAL_PRODUCT_STRONG_SIGNALS):
+            return "Product Design & Development", "Desarrollo de producto", "career_guardrail_industrial_product_over_ora"
+
+    if not area_carrera or not linea_carrera:
+        return fallback_area, fallback_line, fallback_source
+
+    return area_carrera, linea_carrera, None
+
 def has_climate_adaptation_evidence(text_fields: dict[str, str]) -> bool:
     if contains_any_phrase_in_text_fields(text_fields, IDIC_CLIMATE_ADAPTATION_EXACT_SIGNALS):
         return True
@@ -2699,12 +3036,52 @@ def choose_general_idic_fallback(
     if alternative_category and alternative_area and alternative_line:
         return alternative_category, alternative_area, alternative_line, source or "idic_general_fallback_sustainability"
 
-    if contains_any_phrase_in_text_fields(text_fields, IDIC_MACHINE_LEARNING_STRONG_SIGNALS):
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS):
+        return (
+            "Innovación y tecnología digital",
+            "Inteligencia artificial y computación avanzada",
+            "Visión computacional",
+            "idic_general_fallback_computer_vision",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_MACHINE_LEARNING_STRONG_SIGNALS + SYSTEMS_ML_STRONG_SIGNALS):
         return (
             "Innovación y tecnología digital",
             "Inteligencia artificial y computación avanzada",
             "Machine learning y deep learning",
             "idic_general_fallback_machine_learning",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_CYBER_STRONG_SIGNALS):
+        return (
+            "Innovación y tecnología digital",
+            "Transformación digital",
+            "Ciberseguridad y privacidad",
+            "idic_general_fallback_cybersecurity",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, ["iot", "internet of things"]):
+        return (
+            "Innovación y tecnología digital",
+            "Transformación digital",
+            "Internet de las cosas (IoT)",
+            "idic_general_fallback_iot",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, CIVIL_BIM_VDC_STRONG_SIGNALS):
+        return (
+            "Innovación y tecnología digital",
+            "Transformación digital",
+            "Diseño y construcción virtual",
+            "idic_general_fallback_bim_vdc",
+        )
+
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_INNOVATION_MANAGEMENT_STRONG_SIGNALS + INDUSTRIAL_EXTENDED_STRONG_SIGNALS):
+        return (
+            "Gestión y economía del conocimiento",
+            "Innovación empresarial",
+            "Gestión de la innovación",
+            "idic_general_fallback_innovation_management",
         )
 
     if contains_any_phrase_in_text_fields(text_fields, IDIC_EMERGING_TECH_STRONG_SIGNALS):
@@ -2716,12 +3093,13 @@ def choose_general_idic_fallback(
         )
 
     # Último recurso institucional: nunca dejar IDIC en NULL.
-    # Se elige una línea amplia, válida y menos engañosa que forzar adaptación climática.
+    # Se elige gestión de innovación como comodín de menor riesgo para papers de mejora/propuesta,
+    # evitando inflar 'Tecnologías emergentes' sin evidencia.
     return (
-        "Innovación y tecnología digital",
-        "Transformación digital",
-        "Tecnologías emergentes",
-        "idic_general_fallback_default_emerging_technologies",
+        "Gestión y economía del conocimiento",
+        "Innovación empresarial",
+        "Gestión de la innovación",
+        "idic_general_fallback_default_innovation_management",
     )
 
 
@@ -2910,8 +3288,60 @@ def apply_final_idic_guardrails(
         fallback_category, fallback_area, fallback_line, fallback_source = choose_general_idic_fallback(text_fields)
         return fallback_category, fallback_area, fallback_line, fallback_source
 
-    return category_tematica, area_idic, linea_idic, None
+    # Evitar que "Tecnologías emergentes" opere como comodín cuando existe una
+    # señal temática más específica y defendible.
+    if (
+        category_tematica == "Innovación y tecnología digital"
+        and area_idic == "Transformación digital"
+        and linea_idic == "Tecnologías emergentes"
+    ):
+        alternative_category, alternative_area, alternative_line, source = choose_non_climate_sustainability_idic_alternative(
+            text_fields
+        )
+        if alternative_category and alternative_area and alternative_line:
+            return alternative_category, alternative_area, alternative_line, source or "idic_guardrail_specific_over_emerging"
 
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS):
+            return (
+                "Innovación y tecnología digital",
+                "Inteligencia artificial y computación avanzada",
+                "Visión computacional",
+                "idic_guardrail_computer_vision_over_emerging",
+            )
+
+        if contains_any_phrase_in_text_fields(text_fields, IDIC_MACHINE_LEARNING_STRONG_SIGNALS + SYSTEMS_ML_STRONG_SIGNALS):
+            return (
+                "Innovación y tecnología digital",
+                "Inteligencia artificial y computación avanzada",
+                "Machine learning y deep learning",
+                "idic_guardrail_ml_over_emerging",
+            )
+
+        if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_CYBER_STRONG_SIGNALS):
+            return (
+                "Innovación y tecnología digital",
+                "Transformación digital",
+                "Ciberseguridad y privacidad",
+                "idic_guardrail_cyber_over_emerging",
+            )
+
+        if contains_any_phrase_in_text_fields(text_fields, ["iot", "internet of things"]):
+            return (
+                "Innovación y tecnología digital",
+                "Transformación digital",
+                "Internet de las cosas (IoT)",
+                "idic_guardrail_iot_over_emerging",
+            )
+
+        if innovation_present:
+            return (
+                "Gestión y economía del conocimiento",
+                "Innovación empresarial",
+                "Gestión de la innovación",
+                "idic_guardrail_innovation_over_generic_emerging",
+            )
+
+    return category_tematica, area_idic, linea_idic, None
 
 def append_classification_source(result: dict, source_name: str) -> None:
     current = result.get("classification_mode")
@@ -2963,17 +3393,33 @@ def classify_career_dimensions_force_best(
             score = apply_industrial_line_bonus(carrera, linea, text_fields, score)
             line_scores[linea] = score
 
+    fallback_area, fallback_line, _fallback_source = career_fallback_from_domain_rules(carrera, text_fields)
+
+    # Si no hay evidencia temática suficiente, usar fallback controlado por dominio,
+    # no orden alfabético del catálogo.
+    max_score = max(line_scores.values()) if line_scores else 0
+    if max_score < THEMATIC_APPROX_MIN_SCORE and fallback_area and fallback_line:
+        return {"area_carrera_raw": fallback_area, "linea_carrera_raw": fallback_line}
+
     eligible = [
         linea for linea in line_scores.keys()
         if is_line_eligible_by_domain_rules(carrera, linea, text_fields)
     ]
     candidate_pool = eligible or list(line_scores.keys())
     if not candidate_pool:
-        return {"area_carrera_raw": None, "linea_carrera_raw": None}
+        return {"area_carrera_raw": fallback_area, "linea_carrera_raw": fallback_line}
 
     candidate_pool.sort(key=lambda x: (-line_scores.get(x, 0), normalize_generic_text(x)))
     best_linea = candidate_pool[0]
     best_area = coerce_area_carrera_from_linea(carrera, best_linea)
+
+    best_area, best_linea, _guardrail_source = apply_final_career_guardrails(
+        carrera,
+        best_area,
+        best_linea,
+        text_fields,
+    )
+
     return {"area_carrera_raw": best_area, "linea_carrera_raw": best_linea}
 
 
@@ -3787,6 +4233,20 @@ def classify_thematic_fields(
     if idic_guardrail_source:
         append_classification_source(merged, idic_guardrail_source)
 
+    (
+        merged["area_carrera_raw"],
+        merged["linea_carrera_raw"],
+        career_guardrail_source,
+    ) = apply_final_career_guardrails(
+        carrera,
+        merged.get("area_carrera_raw"),
+        merged.get("linea_carrera_raw"),
+        text_fields,
+    )
+
+    if career_guardrail_source:
+        append_classification_source(merged, career_guardrail_source)
+
     # Validación final
     if not is_valid_career_area_line(
         carrera,
@@ -4032,6 +4492,53 @@ def execute_upsert_from_staging(run_id: int) -> None:
         cursor.execute("EXEC dbo.usp_upsert_publications_from_stg @run_id = ?", (run_id,))
         conn.commit()
         cursor.close()
+
+
+
+def reactivate_curated_publications_from_valid_stg(run_id: int) -> int:
+    """
+    Safety patch post-upsert.
+
+    Si una publicación reaparece como válida en un run nuevo, debe quedar activa.
+    Esto corrige casos donde un registro previamente desactivado se actualiza pero
+    conserva is_active = 0 por la lógica del stored procedure.
+    """
+    from mssql_python import connect
+
+    sql_conn_str = get_sql_connection_string()
+
+    with connect(sql_conn_str) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE c
+            SET
+                c.is_active = 1,
+                c.updated_at_utc = SYSUTCDATETIME()
+            FROM curated.publications c
+            INNER JOIN stg.scopus_raw_load s
+                ON s.run_id = ?
+               AND s.is_valid_for_curated = 1
+               AND (
+                    (s.eid IS NOT NULL AND c.eid = s.eid)
+                 OR (s.eid IS NULL AND s.doi_link_raw IS NOT NULL AND c.doi_link = s.doi_link_raw)
+                 OR (
+                        s.eid IS NULL
+                    AND s.doi_link_raw IS NULL
+                    AND s.publication_title_raw IS NOT NULL
+                    AND LOWER(LTRIM(RTRIM(c.publication_title))) = LOWER(LTRIM(RTRIM(s.publication_title_raw)))
+                    AND c.publication_year = TRY_CONVERT(INT, s.publication_year_raw)
+                    )
+               )
+            WHERE ISNULL(c.is_active, 0) = 0
+            """,
+            (run_id,),
+        )
+        affected = cursor.rowcount if cursor.rowcount is not None else 0
+        conn.commit()
+        cursor.close()
+
+    return int(affected) if affected and affected > 0 else 0
 
 
 # =========================
@@ -4992,6 +5499,9 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None
     if eligibility.get("carrera_raw"):
         mapped["carrera_raw"] = eligibility.get("carrera_raw")
 
+    if eligibility.get("metodo_cruce_scopus_raw"):
+        mapped["metodo_cruce_scopus_raw"] = eligibility.get("metodo_cruce_scopus_raw")
+
     if not eligibility.get("eligible"):
         mapped["area_carrera_raw"] = None
         mapped["linea_carrera_raw"] = None
@@ -5326,6 +5836,8 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "engineering_generic_inference_enabled": True,
             "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
             "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
+            "classification_guardrails_version": "v2_run69_quality_patch",
+            "post_upsert_reactivation_enabled": True,
         }
 
         return func.HttpResponse(
@@ -5534,6 +6046,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         execute_upsert_from_staging(run_id)
+        records_reactivated_in_curated = reactivate_curated_publications_from_valid_stg(run_id)
 
         records_rejected_saved_to_staging = 0
         if save_rejected_to_staging:
@@ -5561,6 +6074,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             "records_valid_for_curated": records_inserted,
             "records_rejected": records_rejected,
             "records_rejected_saved_to_staging": records_rejected_saved_to_staging,
+            "records_reactivated_in_curated": records_reactivated_in_curated,
             "save_rejected_to_staging": save_rejected_to_staging,
             "thematic_llm_enabled": use_llm,
             "utc_now": utc_now_iso(),

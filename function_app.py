@@ -712,7 +712,22 @@ def has_external_institution_boundary(value: str | None) -> bool:
 
 
 
-def extract_ulima_local_contexts(value: str | None, max_lookback: int = 3) -> list[str]:
+def extract_ulima_local_contexts(
+    value: str | None,
+    max_lookback: int = 3,
+    max_lookahead: int = 6,
+) -> list[str]:
+    """
+    Extrae el contexto local alrededor de una afiliación ULima.
+
+    Importante para Scopus: algunas afiliaciones vienen como:
+        "Universidad de Lima, ..., Carrera de Ingeniería Industrial, Facultad de Ingeniería"
+    Es decir, la carrera/facultad aparece DESPUÉS de "Universidad de Lima".
+
+    La versión anterior solo miraba hacia atrás, por lo que podía rechazar falsamente
+    artículos válidos de Ingeniería ULima cuando la carrera aparecía hacia adelante
+    dentro del mismo bloque de autor/afiliación.
+    """
     if not value or not is_ulima_text(value):
         return []
 
@@ -725,6 +740,8 @@ def extract_ulima_local_contexts(value: str | None, max_lookback: int = 3) -> li
         if not is_ulima_text(clause):
             continue
 
+        # Mirada hacia atrás: útil para patrones tipo
+        # "Carrera de Ingeniería Industrial, Universidad de Lima".
         start_idx = idx
         steps = 0
         while start_idx > 0 and steps < max_lookback:
@@ -734,7 +751,18 @@ def extract_ulima_local_contexts(value: str | None, max_lookback: int = 3) -> li
             start_idx -= 1
             steps += 1
 
-        context = ", ".join(clauses[start_idx : idx + 1]).strip(" ,")
+        # Mirada hacia adelante: necesaria para patrones tipo
+        # "Universidad de Lima, ..., Carrera de Ingeniería Industrial, Facultad de Ingeniería".
+        end_idx = idx
+        steps = 0
+        while end_idx + 1 < len(clauses) and steps < max_lookahead:
+            next_clause = clauses[end_idx + 1]
+            if has_external_institution_boundary(next_clause):
+                break
+            end_idx += 1
+            steps += 1
+
+        context = ", ".join(clauses[start_idx : end_idx + 1]).strip(" ,")
         if context:
             contexts.append(context)
 

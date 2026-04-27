@@ -120,12 +120,12 @@ def get_career_ai_call_delay_seconds() -> float:
 
     El run con career_ai=true puede generar muchas llamadas seguidas a /responses;
     sin throttling aparecen 429 constantes aunque el SDK reintente.
-    Default conservador: 3.5 segundos.
+    Default conservador: 8.0 segundos.
     """
     raw = os.environ.get("CAREER_AI_CALL_DELAY_SECONDS")
     if raw is None or str(raw).strip() == "":
-        raw = os.environ.get("AZURE_OPENAI_CALL_DELAY_SECONDS", "3.5")
-    return min(60.0, parse_nonnegative_float(raw, default=3.5))
+        raw = os.environ.get("AZURE_OPENAI_CALL_DELAY_SECONDS", "8.0")
+    return min(60.0, parse_nonnegative_float(raw, default=8.0))
 
 
 def get_career_ai_max_calls_per_run() -> int | None:
@@ -136,6 +136,111 @@ def get_career_ai_max_calls_per_run() -> int | None:
 def get_career_ai_throttle_after_429_seconds() -> float:
     raw = os.environ.get("CAREER_AI_EXTRA_SLEEP_AFTER_429_SECONDS", "8.0")
     return min(120.0, parse_nonnegative_float(raw, default=8.0))
+
+
+def get_ingest_singleton_lock_enabled() -> bool:
+    """Evita ejecuciones simultáneas del ingest con un lock distribuido en SQL."""
+    return get_bool_setting("SCOPUS_INGEST_SINGLETON_LOCK_ENABLED", default=True)
+
+
+def get_ingest_singleton_lock_timeout_ms() -> int:
+    raw = os.environ.get("SCOPUS_INGEST_LOCK_TIMEOUT_MS", "0")
+    try:
+        parsed = int(str(raw).strip())
+    except Exception:
+        parsed = 0
+    return max(0, min(600000, parsed))
+
+
+def acquire_scopus_ingest_singleton_lock():
+    """
+    Toma un candado distribuido en Azure SQL usando sp_getapplock.
+
+    El throttle de Python solo funciona dentro de un worker/proceso. Este lock
+    bloquea ejecuciones concurrentes entre workers, instancias o clicks repetidos
+    desde Azure Portal. Mantiene la conexión abierta durante todo el run porque
+    el lock owner es la sesión SQL.
+    """
+    if not get_ingest_singleton_lock_enabled():
+        return None
+
+    from mssql_python import connect
+
+    conn = connect(get_sql_connection_string())
+    cursor = conn.cursor()
+    lock_timeout_ms = get_ingest_singleton_lock_timeout_ms()
+
+    try:
+        cursor.execute(
+            """
+            DECLARE @lock_result INT;
+            EXEC @lock_result = sp_getapplock
+                @Resource = ?,
+                @LockMode = 'Exclusive',
+                @LockOwner = 'Session',
+                @LockTimeout = ?;
+            SELECT @lock_result AS lock_result;
+            """,
+            ("scopus_ingest_pipeline_singleton", lock_timeout_ms),
+        )
+        row = cursor.fetchone()
+        lock_result = int(row_attr(row, "lock_result", 0))
+        cursor.close()
+
+        if lock_result < 0:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise RuntimeError(
+                "Another Scopus ingestion run is already in progress. "
+                "Wait for it to finish before starting a new run. "
+                f"sp_getapplock_result={lock_result}; timeout_ms={lock_timeout_ms}."
+            )
+
+        logging.info("Acquired Scopus ingest singleton lock. sp_getapplock_result=%s", lock_result)
+        return conn
+
+    except Exception:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+        raise
+
+
+def release_scopus_ingest_singleton_lock(lock_conn) -> None:
+    if lock_conn is None:
+        return
+
+    try:
+        cursor = lock_conn.cursor()
+        cursor.execute(
+            """
+            DECLARE @release_result INT;
+            EXEC @release_result = sp_releaseapplock
+                @Resource = ?,
+                @LockOwner = 'Session';
+            SELECT @release_result AS release_result;
+            """,
+            ("scopus_ingest_pipeline_singleton",),
+        )
+        row = cursor.fetchone()
+        release_result = int(row_attr(row, "release_result", 0))
+        lock_conn.commit()
+        cursor.close()
+        logging.info("Released Scopus ingest singleton lock. sp_releaseapplock_result=%s", release_result)
+    except Exception as exc:
+        logging.warning("Could not release Scopus ingest singleton lock cleanly: %s", str(exc))
+    finally:
+        try:
+            lock_conn.close()
+        except Exception:
+            pass
 
 
 _LAST_AZURE_OPENAI_CALL_AT = 0.0
@@ -6517,12 +6622,14 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "azure_openai_max_retries": get_openai_max_retries(),
             "azure_openai_retry_base_seconds": get_openai_retry_base_seconds(),
             "career_ai_extra_sleep_after_429_seconds": get_career_ai_throttle_after_429_seconds(),
+            "scopus_ingest_singleton_lock_enabled": get_ingest_singleton_lock_enabled(),
+            "scopus_ingest_lock_timeout_ms": get_ingest_singleton_lock_timeout_ms(),
             "scopus_max_rows_per_run": get_default_max_rows_per_run(),
             "save_rejected_to_staging_default": resolve_save_rejected_enabled(),
             "engineering_generic_inference_enabled": True,
             "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
             "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
-            "classification_guardrails_version": "v5_run72_career_ai_throttle_and_rate_limit_patch",
+            "classification_guardrails_version": "v6_run73_singleton_lock_and_stronger_throttle_patch",
             "post_upsert_reactivation_enabled": True,
         }
 
@@ -6685,6 +6792,7 @@ def run_ingest_docentes(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="run-ingest-scopus", methods=["GET", "POST"])
 def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
     run_id = None
+    ingest_lock_conn = None
     try:
         raw_container = get_env("RAW_CONTAINER")
         processed_container = get_env("PROCESSED_CONTAINER")
@@ -6721,6 +6829,9 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
 
         reset_ai_runtime_counters()
         validate_career_ai_runtime_configuration(use_career_ai)
+
+        # Candado distribuido: impide corridas simultáneas que saturan Azure OpenAI.
+        ingest_lock_conn = acquire_scopus_ingest_singleton_lock()
 
         run_id = create_pipeline_run(
             trigger_type="MANUAL",
@@ -6793,6 +6904,8 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             "azure_openai_max_retries": get_openai_max_retries(),
             "azure_openai_retry_base_seconds": get_openai_retry_base_seconds(),
             "career_ai_extra_sleep_after_429_seconds": get_career_ai_throttle_after_429_seconds(),
+            "scopus_ingest_singleton_lock_enabled": get_ingest_singleton_lock_enabled(),
+            "scopus_ingest_lock_timeout_ms": get_ingest_singleton_lock_timeout_ms(),
             "utc_now": utc_now_iso(),
             "status": "SUCCESS",
         }
@@ -6809,6 +6922,9 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             records_rejected=records_rejected,
             error_message=None,
         )
+
+        release_scopus_ingest_singleton_lock(ingest_lock_conn)
+        ingest_lock_conn = None
 
         return func.HttpResponse(
             json.dumps(
@@ -6848,6 +6964,10 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
 
     except Exception as exc:
         logging.exception("Scopus ingestion failed")
+
+        if ingest_lock_conn is not None:
+            release_scopus_ingest_singleton_lock(ingest_lock_conn)
+            ingest_lock_conn = None
 
         if run_id is not None:
             update_pipeline_run(

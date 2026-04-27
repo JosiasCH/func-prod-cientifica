@@ -23,6 +23,77 @@ def get_env(name: str) -> str:
     return value
 
 
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on", "si", "sí"}
+
+
+def get_bool_setting(name: str, default: bool = False) -> bool:
+    return parse_bool(os.environ.get(name), default=default)
+
+
+def parse_positive_int(value: str | None, field_name: str) -> int | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except Exception:
+        raise ValueError(f"{field_name} must be an integer.")
+    if parsed < 1:
+        raise ValueError(f"{field_name} must be >= 1.")
+    return parsed
+
+
+def resolve_llm_enabled(request_value: str | None = None) -> bool:
+    if request_value is not None and str(request_value).strip() != "":
+        return parse_bool(request_value, default=False)
+    return get_bool_setting("THEMATIC_LLM_ENABLED", default=False)
+
+
+def get_default_max_rows_per_run() -> int | None:
+    return parse_positive_int(os.environ.get("SCOPUS_MAX_ROWS_PER_RUN"), "SCOPUS_MAX_ROWS_PER_RUN")
+
+
+def slice_rows_by_1_based_range(
+    rows: list[dict],
+    start_row: int | None = None,
+    end_row: int | None = None,
+    max_rows: int | None = None,
+) -> tuple[list[dict], int, int | None]:
+    """
+    Devuelve un subconjunto de filas manteniendo numeración 1-based respecto al CSV original.
+
+    start_row/end_row se refieren a filas de datos, no a la cabecera.
+    Ejemplo: start_row=41&end_row=80 procesa las filas de datos 41..80 del CSV.
+    """
+    total = len(rows)
+    start = start_row or 1
+
+    if end_row is not None and max_rows is not None:
+        raise ValueError("Use either end_row or max_rows, not both.")
+
+    if end_row is not None and end_row < start:
+        raise ValueError("end_row must be >= start_row.")
+
+    if max_rows is not None:
+        end = min(total, start + max_rows - 1)
+    elif end_row is not None:
+        end = min(total, end_row)
+    else:
+        default_max = get_default_max_rows_per_run()
+        if default_max is not None:
+            end = min(total, start + default_max - 1)
+        else:
+            end = total
+
+    if start > total:
+        return [], start, None
+
+    selected = rows[start - 1 : end]
+    return selected, start, end
+
+
 def get_sql_connection_string() -> str:
     return get_env("SQL_CONNECTION_STRING")
 
@@ -3254,35 +3325,76 @@ def classify_thematic_fields(
     author_keywords_value: str | None,
     index_keywords_value: str | None,
     source_title_value: str | None,
+    use_llm: bool | None = None,
 ) -> dict:
+    """
+    Clasificación temática optimizada para carga masiva.
+
+    Cambio clave:
+    - Antes: LLM primero, luego reglas/hints.
+    - Ahora: reglas/hints primero, LLM solo como fallback opcional.
+
+    Esto reduce drásticamente llamadas a Azure OpenAI, evita 429 en cargas grandes
+    y mantiene el fallback obligatorio para no dejar NULLs temáticos en registros aceptados.
+    """
     merged = build_thematic_empty_result()
 
     if not carrera or carrera not in CAREER_AREA_LINE_CATALOG:
         return merged
 
+    if use_llm is None:
+        use_llm = resolve_llm_enabled()
+
     career_fields = ["area_carrera_raw", "linea_carrera_raw"]
     idic_fields = ["category_tematica_raw", "area_idic_raw", "linea_idic_raw"]
 
     # -------------------------
-    # A. CARRERA
+    # A. CARRERA - hints primero
     # -------------------------
-    career_strict = classify_career_with_llm(
+    career_hint = classify_career_dimensions_by_hints(
         carrera=carrera,
         title_value=title_value,
         abstract_value=abstract_value,
         author_keywords_value=author_keywords_value,
         index_keywords_value=index_keywords_value,
         source_title_value=source_title_value,
-        mode="strict",
     )
-    merged = merge_non_null_fields(merged, career_strict, career_fields)
-    if any(career_strict.get(field) for field in career_fields):
-        append_classification_source(merged, "career_llm_strict")
-        if career_strict.get("confidence") is not None and merged.get("confidence") is None:
-            merged["confidence"] = career_strict.get("confidence")
-        set_first_justification(merged, career_strict.get("justification"))
+    merged = merge_non_null_fields(merged, career_hint, career_fields)
+    if any(career_hint.get(field) for field in career_fields):
+        append_classification_source(merged, "career_hints_strict")
 
     if any(not merged.get(field) for field in career_fields):
+        career_hint_approx = classify_career_dimensions_by_hints_approx(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+        merged = merge_non_null_fields(merged, career_hint_approx, career_fields)
+        if any(career_hint_approx.get(field) for field in career_fields):
+            append_classification_source(merged, "career_hints_approx")
+
+    # LLM solo como fallback opcional, no como motor principal.
+    if use_llm and any(not merged.get(field) for field in career_fields):
+        career_strict = classify_career_with_llm(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+            mode="strict",
+        )
+        merged = merge_non_null_fields(merged, career_strict, career_fields)
+        if any(career_strict.get(field) for field in career_fields):
+            append_classification_source(merged, "career_llm_strict")
+            if career_strict.get("confidence") is not None and merged.get("confidence") is None:
+                merged["confidence"] = career_strict.get("confidence")
+            set_first_justification(merged, career_strict.get("justification"))
+
+    if use_llm and any(not merged.get(field) for field in career_fields):
         career_approx = classify_career_with_llm(
             carrera=carrera,
             title_value=title_value,
@@ -3299,51 +3411,50 @@ def classify_thematic_fields(
                 merged["confidence"] = career_approx.get("confidence")
             set_first_justification(merged, career_approx.get("justification"))
 
-    if any(not merged.get(field) for field in career_fields):
-        career_hint = classify_career_dimensions_by_hints(
-            carrera=carrera,
-            title_value=title_value,
-            abstract_value=abstract_value,
-            author_keywords_value=author_keywords_value,
-            index_keywords_value=index_keywords_value,
-            source_title_value=source_title_value,
-        )
-        merged = merge_non_null_fields(merged, career_hint, career_fields)
-        if any(career_hint.get(field) for field in career_fields):
-            append_classification_source(merged, "career_hints_strict")
-
-    if any(not merged.get(field) for field in career_fields):
-        career_hint_approx = classify_career_dimensions_by_hints_approx(
-            carrera=carrera,
-            title_value=title_value,
-            abstract_value=abstract_value,
-            author_keywords_value=author_keywords_value,
-            index_keywords_value=index_keywords_value,
-            source_title_value=source_title_value,
-        )
-        merged = merge_non_null_fields(merged, career_hint_approx, career_fields)
-        if any(career_hint_approx.get(field) for field in career_fields):
-            append_classification_source(merged, "career_hints_approx")
-
     # -------------------------
-    # B. IDIC
+    # B. IDIC - hints primero
     # -------------------------
-    idic_strict = classify_idic_with_llm(
+    idic_hint = classify_idic_dimensions_by_hints(
         title_value=title_value,
         abstract_value=abstract_value,
         author_keywords_value=author_keywords_value,
         index_keywords_value=index_keywords_value,
         source_title_value=source_title_value,
-        mode="strict",
     )
-    merged = merge_non_null_fields(merged, idic_strict, idic_fields)
-    if any(idic_strict.get(field) for field in idic_fields):
-        append_classification_source(merged, "idic_llm_strict")
-        if idic_strict.get("confidence") is not None and merged.get("confidence") is None:
-            merged["confidence"] = idic_strict.get("confidence")
-        set_first_justification(merged, idic_strict.get("justification"))
+    merged = merge_non_null_fields(merged, idic_hint, idic_fields)
+    if any(idic_hint.get(field) for field in idic_fields):
+        append_classification_source(merged, "idic_hints_strict")
 
     if any(not merged.get(field) for field in idic_fields):
+        idic_hint_approx = classify_idic_dimensions_by_hints_approx(
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+        merged = merge_non_null_fields(merged, idic_hint_approx, idic_fields)
+        if any(idic_hint_approx.get(field) for field in idic_fields):
+            append_classification_source(merged, "idic_hints_approx")
+
+    # LLM solo como fallback opcional, no como motor principal.
+    if use_llm and any(not merged.get(field) for field in idic_fields):
+        idic_strict = classify_idic_with_llm(
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+            mode="strict",
+        )
+        merged = merge_non_null_fields(merged, idic_strict, idic_fields)
+        if any(idic_strict.get(field) for field in idic_fields):
+            append_classification_source(merged, "idic_llm_strict")
+            if idic_strict.get("confidence") is not None and merged.get("confidence") is None:
+                merged["confidence"] = idic_strict.get("confidence")
+            set_first_justification(merged, idic_strict.get("justification"))
+
+    if use_llm and any(not merged.get(field) for field in idic_fields):
         idic_approx = classify_idic_with_llm(
             title_value=title_value,
             abstract_value=abstract_value,
@@ -3358,30 +3469,6 @@ def classify_thematic_fields(
             if idic_approx.get("confidence") is not None and merged.get("confidence") is None:
                 merged["confidence"] = idic_approx.get("confidence")
             set_first_justification(merged, idic_approx.get("justification"))
-
-    if any(not merged.get(field) for field in idic_fields):
-        idic_hint = classify_idic_dimensions_by_hints(
-            title_value=title_value,
-            abstract_value=abstract_value,
-            author_keywords_value=author_keywords_value,
-            index_keywords_value=index_keywords_value,
-            source_title_value=source_title_value,
-        )
-        merged = merge_non_null_fields(merged, idic_hint, idic_fields)
-        if any(idic_hint.get(field) for field in idic_fields):
-            append_classification_source(merged, "idic_hints_strict")
-
-    if any(not merged.get(field) for field in idic_fields):
-        idic_hint_approx = classify_idic_dimensions_by_hints_approx(
-            title_value=title_value,
-            abstract_value=abstract_value,
-            author_keywords_value=author_keywords_value,
-            index_keywords_value=index_keywords_value,
-            source_title_value=source_title_value,
-        )
-        merged = merge_non_null_fields(merged, idic_hint_approx, idic_fields)
-        if any(idic_hint_approx.get(field) for field in idic_fields):
-            append_classification_source(merged, "idic_hints_approx")
 
     text_fields = build_thematic_text_fields(
         title_value,
@@ -4518,7 +4605,7 @@ COLUMN_ALIASES = {
 }
 
 
-def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
+def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None = None) -> dict:
     mapped = {}
 
     for target_column, aliases in COLUMN_ALIASES.items():
@@ -4638,6 +4725,7 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict]) -> dict:
             author_keywords_value=mapped.get("author_keywords_raw"),
             index_keywords_value=mapped.get("index_keywords_raw"),
             source_title_value=mapped.get("source_title_raw"),
+            use_llm=use_llm,
         )
 
         if not mapped.get("area_carrera_raw") and thematic.get("area_carrera_raw"):
@@ -4737,6 +4825,8 @@ def insert_rows_to_staging(
     source_file_name: str,
     rows: list[dict],
     docentes_ref: list[dict],
+    source_row_start: int = 1,
+    use_llm: bool | None = None,
 ) -> tuple[int, int]:
     from mssql_python import connect
 
@@ -4747,8 +4837,8 @@ def insert_rows_to_staging(
     with connect(sql_conn_str) as conn:
         cursor = conn.cursor()
 
-        for idx, row in enumerate(rows, start=1):
-            mapped = map_row_to_staging(row, docentes_ref=docentes_ref)
+        for idx, row in enumerate(rows, start=source_row_start):
+            mapped = map_row_to_staging(row, docentes_ref=docentes_ref, use_llm=use_llm)
 
             if mapped.get("__skip_insert__"):
                 rejected += 1
@@ -4880,6 +4970,8 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "storage_account": get_env("DATA_STORAGE_ACCOUNT"),
             "containers": container_status,
             "thematic_llm_configured": is_thematic_llm_configured(),
+            "thematic_llm_enabled": resolve_llm_enabled(),
+            "scopus_max_rows_per_run": get_default_max_rows_per_run(),
         }
 
         return func.HttpResponse(
@@ -5051,6 +5143,13 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         requested_blob = req.params.get("blob_name")
         blob_name = requested_blob or get_latest_csv_blob_name(raw_container)
 
+        # Parámetros para carga masiva segura.
+        # start_row/end_row/max_rows se refieren a filas de datos del CSV, no a la cabecera.
+        start_row = parse_positive_int(req.params.get("start_row"), "start_row")
+        end_row = parse_positive_int(req.params.get("end_row"), "end_row")
+        max_rows = parse_positive_int(req.params.get("max_rows"), "max_rows")
+        use_llm = resolve_llm_enabled(req.params.get("llm"))
+
         run_id = create_pipeline_run(
             trigger_type="MANUAL",
             source_name="SCOPUS",
@@ -5059,7 +5158,15 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         csv_text = download_blob_text(raw_container, blob_name)
-        rows = parse_csv_text(csv_text)
+        all_rows = parse_csv_text(csv_text)
+        total_rows_in_file = len(all_rows)
+
+        rows, effective_start_row, effective_end_row = slice_rows_by_1_based_range(
+            all_rows,
+            start_row=start_row,
+            end_row=end_row,
+            max_rows=max_rows,
+        )
 
         records_read = len(rows)
         records_inserted, records_rejected = insert_rows_to_staging(
@@ -5067,6 +5174,8 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             source_file_name=blob_name,
             rows=rows,
             docentes_ref=docentes_ref,
+            source_row_start=effective_start_row,
+            use_llm=use_llm,
         )
 
         execute_upsert_from_staging(run_id)
@@ -5079,9 +5188,13 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             "source_blob": blob_name,
             "processed_blob": processed_name,
             "periodo_academico_docentes": periodo_academico,
+            "total_rows_in_file": total_rows_in_file,
+            "start_row": effective_start_row,
+            "end_row": effective_end_row,
             "records_read": records_read,
             "records_inserted_to_staging": records_inserted,
             "records_rejected": records_rejected,
+            "thematic_llm_enabled": use_llm,
             "utc_now": utc_now_iso(),
             "status": "SUCCESS",
         }
@@ -5108,9 +5221,13 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
                     "source_blob": blob_name,
                     "processed_blob": processed_name,
                     "periodo_academico_docentes": periodo_academico,
+                    "total_rows_in_file": total_rows_in_file,
+                    "start_row": effective_start_row,
+                    "end_row": effective_end_row,
                     "records_read": records_read,
                     "records_inserted_to_staging": records_inserted,
                     "records_rejected": records_rejected,
+                    "thematic_llm_enabled": use_llm,
                     "utc_now": utc_now_iso(),
                 },
                 ensure_ascii=False,

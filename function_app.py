@@ -109,6 +109,84 @@ def resolve_save_rejected_enabled(request_value: str | None = None) -> bool:
     return get_bool_setting("SCOPUS_SAVE_REJECTED_TO_STAGING", default=True)
 
 
+def get_request_json_payload(req: func.HttpRequest) -> dict:
+    """
+    Lee payload JSON si el endpoint se ejecuta por POST desde Azure Portal/Test/Run.
+
+    Azure Functions expone query string en req.params, pero en el portal muchas veces
+    los parámetros se envían por body. Sin esta lectura, career_ai=true puede quedar
+    ignorado y el run reporta career_ambiguity_ai_enabled=false.
+    """
+    try:
+        payload = req.get_json()
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_request_value(req: func.HttpRequest, payload: dict, aliases: list[str]) -> str | None:
+    """
+    Devuelve el primer valor encontrado en query string o JSON body.
+    Soporta alias para evitar fallos por nombres como career_ai, careerAi,
+    use_career_ai, etc.
+    """
+    for alias in aliases:
+        value = req.params.get(alias)
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+
+    for alias in aliases:
+        value = payload.get(alias) if isinstance(payload, dict) else None
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+
+    return None
+
+
+def resolve_request_bool(
+    req: func.HttpRequest,
+    payload: dict,
+    aliases: list[str],
+    env_name: str | None = None,
+    default: bool = False,
+) -> bool:
+    """
+    Boolean robusto para parámetros HTTP. Primero toma query/body; si no existe,
+    cae a variable de entorno opcional.
+    """
+    request_value = get_request_value(req, payload, aliases)
+    if request_value is not None:
+        return parse_bool(request_value, default=default)
+
+    if env_name:
+        return get_bool_setting(env_name, default=default)
+
+    return default
+
+
+def validate_career_ai_runtime_configuration(use_career_ai: bool) -> None:
+    """
+    Si se solicita career_ai=true, no se debe continuar silenciosamente sin Azure OpenAI.
+    Antes el pipeline podía seguir con heurística y el usuario veía ai_inferred=0.
+    """
+    if not use_career_ai:
+        return
+
+    missing: list[str] = []
+    if not os.environ.get("AZURE_OPENAI_API_KEY"):
+        missing.append("AZURE_OPENAI_API_KEY")
+    if not (os.environ.get("AZURE_OPENAI_BASE_URL") or os.environ.get("AZURE_OPENAI_ENDPOINT")):
+        missing.append("AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_BASE_URL")
+    if not os.environ.get("AZURE_OPENAI_RESPONSES_MODEL"):
+        missing.append("AZURE_OPENAI_RESPONSES_MODEL")
+
+    if missing:
+        raise RuntimeError(
+            "career_ai=true was requested, but Azure OpenAI is not fully configured. "
+            "Missing settings: " + ", ".join(missing)
+        )
+
+
 def slice_rows_by_1_based_range(
     rows: list[dict],
     start_row: int | None = None,
@@ -1335,6 +1413,118 @@ def format_ai_review_reason(prefix: str, ai_result: dict, score_map: dict[str, i
     )
 
 
+GENERIC_ENGINEERING_PHYSICS_REVIEW_SIGNALS = [
+    "magnetogenesis", "electroweak", "cosmology", "cosmological", "supercooled",
+    "phase transition", "primordial", "particle physics", "high energy physics",
+    "journal of high energy physics", "string theory",
+]
+
+GENERIC_ENGINEERING_EDUCATION_REVIEW_SIGNALS = [
+    "research training", "methodological design", "engineering students",
+    "early childhood", "online education", "preschool", "curriculum",
+    "education", "educational", "higher education", "learning outcomes",
+]
+
+GENERIC_ENGINEERING_MEDICAL_REVIEW_SIGNALS = [
+    "brachytherapy", "radiotherapy", "clinical", "patient", "patients",
+    "cancer", "dose distribution", "treatment planning", "medical device",
+]
+
+GENERIC_ENGINEERING_MATERIAL_WATER_REVIEW_SIGNALS = [
+    "photoelectrocatalytic", "photoelectrocatalysis", "water disinfection",
+    "water treatment", "arsenic removal", "adsorption", "activated carbon",
+    "chitosan", "carbon nanotubes", "electrode", "photoanode", "azo dyes",
+]
+
+
+def has_strong_systems_evidence(text_fields: dict[str, str]) -> bool:
+    return contains_any_phrase_in_text_fields(
+        text_fields,
+        SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS
+        + SYSTEMS_ML_STRONG_SIGNALS
+        + SYSTEMS_CYBER_STRONG_SIGNALS
+        + SYSTEMS_GAME_STRONG_SIGNALS
+        + SYSTEMS_ARVR_STRONG_SIGNALS
+        + SYSTEMS_AGENT_STRONG_SIGNALS
+        + SYSTEMS_SOFTWARE_STRONG_SIGNALS
+        + SYSTEMS_GENDER_TECH_STRONG_SIGNALS,
+    )
+
+
+def has_strong_industrial_evidence(text_fields: dict[str, str]) -> bool:
+    return contains_any_phrase_in_text_fields(
+        text_fields,
+        INDUSTRIAL_OEM_STRONG_SIGNALS
+        + INDUSTRIAL_SCM_STRONG_SIGNALS
+        + INDUSTRIAL_ORA_STRONG_SIGNALS
+        + INDUSTRIAL_PDD_STRONG_SIGNALS
+        + INDUSTRIAL_EXTENDED_STRONG_SIGNALS
+        + CHEM_MATERIAL_PRODUCT_STRONG_SIGNALS,
+    )
+
+
+def has_strong_civil_evidence(text_fields: dict[str, str]) -> bool:
+    return contains_any_phrase_in_text_fields(
+        text_fields,
+        CIVIL_STRUCTURAL_STRONG_SIGNALS
+        + CIVIL_CONSTRUCTION_MATERIALS_STRONG_SIGNALS
+        + CIVIL_BIM_VDC_STRONG_SIGNALS
+        + CIVIL_WATER_STRONG_SIGNALS
+        + CIVIL_TRANSPORT_GEOTECH_STRONG_SIGNALS,
+    )
+
+
+def generic_engineering_heuristic_review_reason(
+    inferred_careers: list[str],
+    text_fields: dict[str, str],
+    score_map: dict[str, int] | None = None,
+) -> str | None:
+    """
+    Filtro conservador para afiliaciones ULima + Facultad/Escuela de Ingeniería
+    sin carrera explícita cuando NO se usa IA.
+
+    Objetivo: evitar que la heurística fuerce Sistemas/VR/Visión/Software o carreras
+    débiles en papers de educación, física, medicina, materiales o agua.
+    """
+    careers = filter_valid_engineering_careers(inferred_careers)
+    if not careers:
+        return "NO_VALID_INFERRED_CAREER"
+
+    score_detail = serialize_score_map_for_reason(score_map or {})
+    systems_evidence = has_strong_systems_evidence(text_fields)
+    industrial_evidence = has_strong_industrial_evidence(text_fields)
+    civil_evidence = has_strong_civil_evidence(text_fields)
+
+    # Señales claramente fuera del alcance o demasiado ambiguas para decidir carrera por reglas.
+    if contains_any_phrase_in_text_fields(text_fields, GENERIC_ENGINEERING_PHYSICS_REVIEW_SIGNALS):
+        return f"UNSAFE_HEURISTIC_PHYSICS_OR_COSMOLOGY; scores={score_detail}"
+
+    if contains_any_phrase_in_text_fields(text_fields, GENERIC_ENGINEERING_MEDICAL_REVIEW_SIGNALS):
+        return f"UNSAFE_HEURISTIC_MEDICAL_OR_CLINICAL_DEVICE; scores={score_detail}"
+
+    # Educación puede ser de Sistemas/Civil/Industrial, pero la carrera no se debe forzar
+    # salvo que haya evidencia técnica fuerte adicional.
+    if contains_any_phrase_in_text_fields(text_fields, GENERIC_ENGINEERING_EDUCATION_REVIEW_SIGNALS):
+        if not (systems_evidence or industrial_evidence or civil_evidence):
+            return f"UNSAFE_HEURISTIC_EDUCATION_GENERIC; scores={score_detail}"
+
+    # Materiales/agua no debe terminar como Sistemas por palabras sueltas de diseño/dispositivo.
+    if "Ingeniería de Sistemas" in careers and contains_any_phrase_in_text_fields(text_fields, GENERIC_ENGINEERING_MATERIAL_WATER_REVIEW_SIGNALS):
+        if not systems_evidence:
+            return f"UNSAFE_HEURISTIC_SYSTEMS_ASSIGNED_TO_MATERIALS_OR_WATER; scores={score_detail}"
+
+    if "Ingeniería de Sistemas" in careers and not systems_evidence:
+        return f"UNSAFE_HEURISTIC_SYSTEMS_WITHOUT_STRONG_SYSTEMS_EVIDENCE; scores={score_detail}"
+
+    if "Ingeniería Industrial" in careers and not industrial_evidence:
+        return f"UNSAFE_HEURISTIC_INDUSTRIAL_WITHOUT_STRONG_INDUSTRIAL_EVIDENCE; scores={score_detail}"
+
+    if "Ingeniería Civil" in careers and not civil_evidence:
+        return f"UNSAFE_HEURISTIC_CIVIL_WITHOUT_STRONG_CIVIL_EVIDENCE; scores={score_detail}"
+
+    return None
+
+
 def choose_primary_career_for_classification(carrera_raw: str | None, text_fields: dict[str, str]) -> str | None:
     """
     La publicación puede tener multicarrera en carrera_raw. Para no duplicar registros,
@@ -1454,20 +1644,42 @@ def determine_row_engineering_eligibility(
                     "metodo_cruce_scopus_raw": f"AFFIL_GENERIC_ENG_AI_{inferred_method_suffix}",
                 }
 
-            if ai_result.get("reason") not in {"AI_NOT_CONFIGURED", "AI_FAILED_OR_NON_JSON", "NO_AI_RESULT"}:
-                prefix = "REVIEW_ULIMA_ENGINEERING_AI_NO_TARGET_CAREER"
-                if ai_result.get("decision") == "REJECT_NOT_TARGET" or ai_result.get("reason") == "AI_REJECT_NOT_TARGET":
-                    prefix = "REJECT_ULIMA_ENGINEERING_AI_NOT_TARGET_CAREER"
-                return {
-                    "eligible": False,
-                    "carrera_raw": None,
-                    "reason": format_ai_review_reason(prefix, ai_result, score_map),
-                }
-            # Si la IA falló o no está configurada, continuar con fallback heurístico conservador.
+            prefix = "REVIEW_ULIMA_ENGINEERING_AI_NO_TARGET_CAREER"
+            if ai_result.get("decision") == "REJECT_NOT_TARGET" or ai_result.get("reason") == "AI_REJECT_NOT_TARGET":
+                prefix = "REJECT_ULIMA_ENGINEERING_AI_NOT_TARGET_CAREER"
+
+            return {
+                "eligible": False,
+                "carrera_raw": None,
+                "reason": format_ai_review_reason(prefix, ai_result, score_map),
+            }
 
         inferred_careers = filter_valid_engineering_careers(inferred.get("careers"))
 
         if inferred_careers:
+            text_fields_for_safety = build_thematic_text_fields(
+                title_value,
+                abstract_value,
+                author_keywords_value,
+                index_keywords_value,
+                source_title_value,
+            )
+            unsafe_reason = generic_engineering_heuristic_review_reason(
+                inferred_careers=inferred_careers,
+                text_fields=text_fields_for_safety,
+                score_map=score_map,
+            )
+            if unsafe_reason:
+                return {
+                    "eligible": False,
+                    "carrera_raw": None,
+                    "reason": (
+                        "REVIEW_ULIMA_ENGINEERING_GENERIC_HEURISTIC_UNSAFE: "
+                        "ULima engineering context detected, but heuristic career inference is not safe enough. "
+                        f"inference_reason={unsafe_reason}"
+                    ),
+                }
+
             method_suffix_map = {
                 "Ingeniería Industrial": "INDUSTRIAL",
                 "Ingeniería Civil": "CIVIL",
@@ -3229,6 +3441,21 @@ def apply_final_career_guardrails(
             return fallback_area, fallback_line, fallback_source or "career_guardrail_civil_no_hydraulic_evidence"
 
     if carrera == "Ingeniería de Sistemas":
+        if linea_carrera == "Visión computacional" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS):
+            return fallback_area, fallback_line, fallback_source or "career_guardrail_systems_no_computer_vision_evidence"
+
+        if linea_carrera == "Realidad virtual y aumentada" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ARVR_STRONG_SIGNALS):
+            return fallback_area, fallback_line, fallback_source or "career_guardrail_systems_no_arvr_evidence"
+
+        if linea_carrera == "Ingeniería de software" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_SOFTWARE_STRONG_SIGNALS):
+            return fallback_area, fallback_line, fallback_source or "career_guardrail_systems_no_software_evidence"
+
+        if linea_carrera == "Aprendizaje automático" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ML_STRONG_SIGNALS):
+            return fallback_area, fallback_line, fallback_source or "career_guardrail_systems_no_ml_evidence"
+
+        if linea_carrera == "Construcción de juegos y gamificación" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_GAME_STRONG_SIGNALS):
+            return fallback_area, fallback_line, fallback_source or "career_guardrail_systems_no_game_evidence"
+
         if linea_carrera == "Agentes virtuales" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_AGENT_STRONG_SIGNALS):
             return fallback_area, fallback_line, fallback_source or "career_guardrail_systems_no_agent_evidence"
 
@@ -6126,7 +6353,7 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "engineering_generic_inference_enabled": True,
             "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
             "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
-            "classification_guardrails_version": "v3_run70_career_ai_patch",
+            "classification_guardrails_version": "v4_run71_career_ai_activation_and_safe_generic_patch",
             "post_upsert_reactivation_enabled": True,
         }
 
@@ -6296,17 +6523,34 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         periodo_academico = get_env("DOCENTES_ACTIVE_PERIOD")
         docentes_ref = get_docentes_reference(periodo_academico)
 
-        requested_blob = req.params.get("blob_name")
+        request_payload = get_request_json_payload(req)
+
+        requested_blob = get_request_value(req, request_payload, ["blob_name", "blobName", "source_blob"])
         blob_name = requested_blob or get_latest_csv_blob_name(raw_container)
 
         # Parámetros para carga masiva segura.
         # start_row/end_row/max_rows se refieren a filas de datos del CSV, no a la cabecera.
-        start_row = parse_positive_int(req.params.get("start_row"), "start_row")
-        end_row = parse_positive_int(req.params.get("end_row"), "end_row")
-        max_rows = parse_positive_int(req.params.get("max_rows"), "max_rows")
-        use_llm = resolve_llm_enabled(req.params.get("llm"))
-        use_career_ai = resolve_career_ambiguity_ai_enabled(req.params.get("career_ai"))
-        save_rejected_to_staging = resolve_save_rejected_enabled(req.params.get("save_rejected"))
+        start_row = parse_positive_int(get_request_value(req, request_payload, ["start_row", "startRow"]), "start_row")
+        end_row = parse_positive_int(get_request_value(req, request_payload, ["end_row", "endRow"]), "end_row")
+        max_rows = parse_positive_int(get_request_value(req, request_payload, ["max_rows", "maxRows"]), "max_rows")
+
+        llm_value = get_request_value(req, request_payload, ["llm", "thematic_llm", "use_llm", "useLlm"])
+        career_ai_value = get_request_value(
+            req,
+            request_payload,
+            ["career_ai", "careerAi", "career_ambiguity_ai", "career_llm", "ai_career", "use_career_ai", "useCareerAi"],
+        )
+        save_rejected_value = get_request_value(
+            req,
+            request_payload,
+            ["save_rejected", "saveRejected", "save_rejected_to_staging", "saveRejectedToStaging"],
+        )
+
+        use_llm = resolve_llm_enabled(llm_value)
+        use_career_ai = resolve_career_ambiguity_ai_enabled(career_ai_value)
+        save_rejected_to_staging = resolve_save_rejected_enabled(save_rejected_value)
+
+        validate_career_ai_runtime_configuration(use_career_ai)
 
         run_id = create_pipeline_run(
             trigger_type="MANUAL",
@@ -6370,6 +6614,8 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             "save_rejected_to_staging": save_rejected_to_staging,
             "thematic_llm_enabled": use_llm,
             "career_ambiguity_ai_enabled": use_career_ai,
+            "career_ambiguity_ai_requested_value": career_ai_value,
+            "career_ambiguity_ai_configured": is_thematic_llm_configured(),
             "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
             "utc_now": utc_now_iso(),
             "status": "SUCCESS",

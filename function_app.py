@@ -168,8 +168,42 @@ def clean_author_full_name(value: str) -> str:
 
 
 def is_ulima_text(value: str | None) -> bool:
+    """
+    Detecta Universidad de Lima real y evita falsos positivos como
+    "University of Lima Sur" o instituciones que solo contienen la palabra Lima.
+
+    Esta función se usa en análisis por segmento de afiliación, por lo que debe ser
+    estricta: aceptar ULima real, pero no universidades externas con nombres parecidos.
+    """
     norm = normalize_generic_text(value)
-    return ("universidad de lima" in norm) or ("university of lima" in norm)
+    if not norm:
+        return False
+
+    negative_patterns = [
+        "universidad de lima sur",
+        "university of lima sur",
+        "technological university of lima sur",
+        "national technological university of lima sur",
+        "universidad tecnologica de lima sur",
+        "universidad nacional tecnologica de lima sur",
+        "universidad nacional de ingenieria",
+        "national university of engineering",
+        "universidad tecnologica del peru",
+        "technological university of peru",
+        "universidad tecnologica de los andes",
+        "universidad nacional mayor de san marcos",
+    ]
+
+    if any(pattern in norm for pattern in negative_patterns):
+        return False
+
+    positive_patterns = [
+        "universidad de lima",
+        "university of lima",
+        "ulima",
+    ]
+
+    return any(pattern in norm for pattern in positive_patterns)
 
 
 def row_attr(row, attr: str, idx: int):
@@ -701,21 +735,34 @@ def missing_thematic_fields(payload: dict) -> list[str]:
 CAREER_PATTERNS = {
     "Ingeniería Industrial": [
         "carrera de ingenieria industrial",
+        "programa de ingenieria industrial",
         "industrial engineering career",
+        "industrial engineering program",
         "ingenieria industrial",
+        "ingenieria industiral",
+        "ingenieria indutrial",
+        "ingenieria industrial y",
         "industrial engineering",
+        "industrial and systems engineering",
     ],
     "Ingeniería de Sistemas": [
         "carrera de ingenieria de sistemas",
+        "programa de ingenieria de sistemas",
         "systems engineering career",
+        "systems engineering program",
         "ingenieria de sistemas",
         "ingenieria de sistemas computacionales",
+        "ingenieria informatica",
         "systems engineering",
         "computer systems engineering",
+        "information systems engineering",
+        "software engineering",
     ],
     "Ingeniería Civil": [
         "carrera de ingenieria civil",
+        "programa de ingenieria civil",
         "civil engineering career",
+        "civil engineering program",
         "ingenieria civil",
         "civil engineering",
     ],
@@ -749,12 +796,22 @@ VALID_SCOPUS_DOCUMENT_TYPES = {
 
 ULIMA_ENGINEERING_CONTEXT_HINTS = [
     "facultad de ingenieria",
+    "facultad de ingenieria y arquitectura",
+    "facultad de lngenieria",
+    "facultad de ingeneria",
+    "facultad de ingenieri",
     "faculty of engineering",
+    "faculty of engineering and architecture",
+    "engineering faculty",
     "school of engineering",
+    "school of engineering and architecture",
     "engineering school",
     "escuela de ingenieria",
     "department of engineering",
     "departamento de ingenieria",
+    "carrera de ingenieria",
+    "programa de ingenieria",
+    "engineering department",
 ]
 
 EXTERNAL_INSTITUTION_BOUNDARY_HINTS = [
@@ -903,17 +960,182 @@ def resolve_engineering_careers_from_affiliation_text(*values: str | None) -> li
 
 
 
+
+# =========================
+# GENERIC ENGINEERING CAREER INFERENCE
+# =========================
+CAREER_INFERENCE_MIN_SCORE = 5
+CAREER_INFERENCE_MIN_MARGIN = 2
+
+CAREER_INFERENCE_SIGNALS = {
+    "Ingeniería Industrial": [
+        "lean", "lean manufacturing", "5s", "smed", "tpm", "slp", "kanban", "kaizen",
+        "bpm", "dmaic", "tqm", "oee", "abc classification", "standard work",
+        "standardized work", "warehouse", "warehousing", "inventory", "inventory management",
+        "supply chain", "logistics", "transportation", "transport", "production management",
+        "production efficiency", "production planning", "manufacturing", "productivity",
+        "productivity improvement", "process improvement", "continuous improvement",
+        "quality control", "quality management", "operations management", "operational efficiency",
+        "eoq", "mrp", "lot sizing", "service level", "otif", "fill rate", "picking",
+        "slotting", "layout", "facility layout", "work study", "ergonomic risk",
+    ],
+    "Ingeniería Civil": [
+        "bim", "building information modelling", "building information modeling",
+        "construction", "building", "structural", "structure", "seismic", "earthquake",
+        "concrete", "reinforced concrete", "beam", "beams", "masonry", "asphalt",
+        "pavement", "stone mastic asphalt", "sma", "soil", "geotechnical",
+        "geotechnics", "hydraulic", "hydrology", "drainage", "irrigation", "sediment",
+        "water resources", "bridge", "housing", "infrastructure", "urban regeneration",
+        "photogrammetry", "uav", "road", "road infrastructure", "traffic",
+    ],
+    "Ingeniería de Sistemas": [
+        "machine learning", "deep learning", "artificial intelligence", "computer vision",
+        "image processing", "object detection", "human detection", "nlp",
+        "natural language processing", "large language model", "llm", "software",
+        "software engineering", "information systems", "data mining", "process mining",
+        "algorithm", "algorithms", "neural network", "neural networks", "iot",
+        "internet of things", "cybersecurity", "cloud", "app", "mobile application",
+        "web application", "database", "data science", "predictive model", "classification model",
+    ],
+}
+
+INDUSTRIAL_CONTEXT_FOR_ML_SIGNALS = [
+    "pyrolysis", "crude oil yield", "production", "manufacturing", "supply chain",
+    "inventory", "warehouse", "logistics", "operations", "process", "quality",
+    "productivity", "yield", "optimization", "operational",
+]
+
+SYSTEMS_CONTEXT_FOR_ML_SIGNALS = [
+    "computer vision", "image", "images", "video", "object detection", "human detection",
+    "nlp", "software", "cybersecurity", "iot", "cloud", "information systems",
+]
+
+
+def score_career_inference_from_text_fields(text_fields: dict[str, str]) -> dict[str, int]:
+    """
+    Puntúa carrera objetivo cuando la afiliación ULima dice Ingeniería genérica
+    pero no especifica Industrial/Civil/Sistemas.
+
+    No reemplaza una carrera explícita de afiliación/docente. Solo rescata casos
+    que antes se rechazaban injustamente por falta de carrera explícita.
+    """
+    score_map = {career: 0 for career in VALID_ENGINEERING_CAREERS}
+
+    field_weights = {
+        "title": 4,
+        "abstract": 2,
+        "author_keywords": 3,
+        "index_keywords": 2,
+        "source_title": 1,
+    }
+
+    for career, signals in CAREER_INFERENCE_SIGNALS.items():
+        for field_name, text_value in text_fields.items():
+            if not text_value:
+                continue
+            weight = field_weights.get(field_name, 1)
+            score_map[career] += weight * count_phrase_hits_in_text(text_value, signals)
+
+    corpus = " | ".join(v for v in text_fields.values() if v)
+    ml_present = count_phrase_hits_in_text(corpus, ["machine learning", "deep learning", "predictive model", "predictive models"]) > 0
+    if ml_present:
+        if count_phrase_hits_in_text(corpus, INDUSTRIAL_CONTEXT_FOR_ML_SIGNALS) > 0:
+            score_map["Ingeniería Industrial"] += 4
+        if count_phrase_hits_in_text(corpus, SYSTEMS_CONTEXT_FOR_ML_SIGNALS) > 0:
+            score_map["Ingeniería de Sistemas"] += 4
+
+    return score_map
+
+
+def infer_target_career_from_generic_engineering_context(
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> dict:
+    text_fields = build_thematic_text_fields(
+        title_value,
+        abstract_value,
+        author_keywords_value,
+        index_keywords_value,
+        source_title_value,
+    )
+
+    if not any(text_fields.values()):
+        return {
+            "careers": [],
+            "score_map": {career: 0 for career in VALID_ENGINEERING_CAREERS},
+            "reason": "NO_THEMATIC_TEXT",
+        }
+
+    score_map = score_career_inference_from_text_fields(text_fields)
+    ranked = sorted(score_map.items(), key=lambda x: (-x[1], normalize_generic_text(x[0])))
+
+    if not ranked or ranked[0][1] < CAREER_INFERENCE_MIN_SCORE:
+        return {
+            "careers": [],
+            "score_map": score_map,
+            "reason": "INSUFFICIENT_SCORE",
+        }
+
+    best_career, best_score = ranked[0]
+    second_score = ranked[1][1] if len(ranked) > 1 else 0
+
+    if (best_score - second_score) < CAREER_INFERENCE_MIN_MARGIN:
+        return {
+            "careers": [],
+            "score_map": score_map,
+            "reason": "AMBIGUOUS_SCORE",
+        }
+
+    return {
+        "careers": [best_career],
+        "score_map": score_map,
+        "reason": "INFERRED_FROM_THEMATIC_EVIDENCE",
+    }
+
+
+def choose_primary_career_for_classification(carrera_raw: str | None, text_fields: dict[str, str]) -> str | None:
+    """
+    La publicación puede tener multicarrera en carrera_raw. Para no duplicar registros,
+    se conserva carrera_raw como lista separada por ';'. Esta función solo elige una
+    carrera primaria para clasificar area_carrera/linea_carrera de la fila principal.
+
+    El análisis por carrera en Power BI debe resolverse después con una tabla puente,
+    no duplicando autores ni publicaciones en curated.publications.
+    """
+    careers = filter_valid_engineering_careers(split_semicolon_values(carrera_raw))
+    if not careers:
+        return None
+    if len(careers) == 1:
+        return careers[0]
+
+    score_map = score_career_inference_from_text_fields(text_fields)
+    ranked = sorted(careers, key=lambda c: (-score_map.get(c, 0), careers.index(c)))
+    return ranked[0] if ranked else careers[0]
+
+
 def determine_row_engineering_eligibility(
     document_type_value: str | None,
     authors_with_affiliations_value: str | None,
     affiliations_value: str | None,
     enrichment: dict,
+    title_value: str | None = None,
+    abstract_value: str | None = None,
+    author_keywords_value: str | None = None,
+    index_keywords_value: str | None = None,
+    source_title_value: str | None = None,
 ) -> dict:
     """
     Determina si una fila Scopus debe pasar a curated.
 
-    Devuelve razones más granulares para auditar rechazados. Esto es crítico para
-    detectar falsos negativos de afiliación en cargas masivas.
+    Corrección principal:
+    - No rechazar automáticamente afiliaciones ULima + Ingeniería genérica.
+    - Si la afiliación es ULima + Ingeniería pero no trae carrera explícita, inferir
+      Industrial/Civil/Sistemas usando título, abstract, keywords y source title.
+    - Mantener segmentación por afiliación para evitar mezclar Ingeniería de otra
+      universidad con Universidad de Lima.
     """
     normalized_doc_type = normalize_document_type_for_filter(document_type_value)
     if normalized_doc_type not in VALID_SCOPUS_DOCUMENT_TYPES:
@@ -948,7 +1170,36 @@ def determine_row_engineering_eligibility(
             "reason": None,
         }
 
-    # Razones separadas para poder auditar bien los rechazados del CSV grande.
+    if has_engineering_context and not careers_from_affiliation:
+        inferred = infer_target_career_from_generic_engineering_context(
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
+        inferred_careers = filter_valid_engineering_careers(inferred.get("careers"))
+
+        if inferred_careers:
+            return {
+                "eligible": True,
+                "carrera_raw": "; ".join(inferred_careers),
+                "reason": None,
+            }
+
+        score_map = inferred.get("score_map") or {}
+        reason_detail = inferred.get("reason") or "NO_INFERENCE"
+        score_detail = "; ".join(f"{career}={score_map.get(career, 0)}" for career in VALID_ENGINEERING_CAREERS)
+        return {
+            "eligible": False,
+            "carrera_raw": None,
+            "reason": (
+                "REVIEW_ULIMA_ENGINEERING_GENERIC_NO_TARGET_CAREER: "
+                "ULima engineering context detected, but no explicit target career and thematic inference was not strong enough. "
+                f"inference_reason={reason_detail}; scores={score_detail}"
+            ),
+        }
+
     if not has_ulima_affiliation and not enrichment.get("es_ulima_raw_detected"):
         return {
             "eligible": False,
@@ -960,14 +1211,7 @@ def determine_row_engineering_eligibility(
         return {
             "eligible": False,
             "carrera_raw": None,
-            "reason": "REJECT_ULIMA_BUT_NO_ENGINEERING_CONTEXT: ULima affiliation detected, but no Faculty/Career/School/Department of Engineering context detected.",
-        }
-
-    if has_engineering_context and not careers_from_affiliation:
-        return {
-            "eligible": False,
-            "carrera_raw": None,
-            "reason": "REJECT_ENGINEERING_CONTEXT_BUT_NO_TARGET_CAREER: engineering context detected, but no Industrial/Civil/Systems career detected.",
+            "reason": "REJECT_REAL_ULIMA_BUT_NO_ENGINEERING_CONTEXT: ULima affiliation detected, but no Faculty/Career/School/Department of Engineering context detected in the same ULima segment.",
         }
 
     if careers_from_affiliation and not has_engineering_context:
@@ -4738,6 +4982,11 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None
         authors_with_affiliations_value=authors_with_affiliations_value,
         affiliations_value=affiliations_value,
         enrichment=enrichment,
+        title_value=mapped.get("publication_title_raw"),
+        abstract_value=mapped.get("abstract_scopus_raw"),
+        author_keywords_value=mapped.get("author_keywords_raw"),
+        index_keywords_value=mapped.get("index_keywords_raw"),
+        source_title_value=mapped.get("source_title_raw"),
     )
 
     if eligibility.get("carrera_raw"):
@@ -4763,9 +5012,17 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None
     # -------------------------
     # Thematic classification
     # -------------------------
-    carrera_for_classification = mapped.get("carrera_raw")
-    if carrera_for_classification and ";" in str(carrera_for_classification):
-        carrera_for_classification = str(carrera_for_classification).split(";", 1)[0].strip()
+    text_fields_for_primary_career = build_thematic_text_fields(
+        mapped.get("publication_title_raw"),
+        mapped.get("abstract_scopus_raw"),
+        mapped.get("author_keywords_raw"),
+        mapped.get("index_keywords_raw"),
+        mapped.get("source_title_raw"),
+    )
+    carrera_for_classification = choose_primary_career_for_classification(
+        mapped.get("carrera_raw"),
+        text_fields_for_primary_career,
+    )
 
     if carrera_for_classification:
         thematic = classify_thematic_fields(
@@ -5066,6 +5323,9 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "thematic_llm_enabled": resolve_llm_enabled(),
             "scopus_max_rows_per_run": get_default_max_rows_per_run(),
             "save_rejected_to_staging_default": resolve_save_rejected_enabled(),
+            "engineering_generic_inference_enabled": True,
+            "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
+            "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
         }
 
         return func.HttpResponse(

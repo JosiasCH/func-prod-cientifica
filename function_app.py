@@ -55,6 +55,18 @@ def get_default_max_rows_per_run() -> int | None:
     return parse_positive_int(os.environ.get("SCOPUS_MAX_ROWS_PER_RUN"), "SCOPUS_MAX_ROWS_PER_RUN")
 
 
+def resolve_save_rejected_enabled(request_value: str | None = None) -> bool:
+    """
+    Controla si los registros rechazados se guardan en stg.scopus_raw_load para auditoría.
+
+    Por defecto queda ACTIVADO porque en cargas masivas necesitamos revisar falsos negativos
+    por afiliación/carrera/tipo documental sin contaminar curated.publications.
+    """
+    if request_value is not None and str(request_value).strip() != "":
+        return parse_bool(request_value, default=True)
+    return get_bool_setting("SCOPUS_SAVE_REJECTED_TO_STAGING", default=True)
+
+
 def slice_rows_by_1_based_range(
     rows: list[dict],
     start_row: int | None = None,
@@ -897,12 +909,18 @@ def determine_row_engineering_eligibility(
     affiliations_value: str | None,
     enrichment: dict,
 ) -> dict:
+    """
+    Determina si una fila Scopus debe pasar a curated.
+
+    Devuelve razones más granulares para auditar rechazados. Esto es crítico para
+    detectar falsos negativos de afiliación en cargas masivas.
+    """
     normalized_doc_type = normalize_document_type_for_filter(document_type_value)
     if normalized_doc_type not in VALID_SCOPUS_DOCUMENT_TYPES:
         return {
             "eligible": False,
             "carrera_raw": None,
-            "reason": f"Invalid document type: {document_type_value or 'UNKNOWN'}",
+            "reason": f"REJECT_INVALID_DOCUMENT_TYPE: {document_type_value or 'UNKNOWN'}",
         }
 
     careers_from_enrichment = filter_valid_engineering_careers(
@@ -920,17 +938,49 @@ def determine_row_engineering_eligibility(
         affiliations_value,
     )
     careers_from_affiliation = filter_valid_engineering_careers(affiliation_details.get("careers"))
-    if careers_from_affiliation and affiliation_details.get("has_ulima_engineering_context"):
+    has_ulima_affiliation = bool(affiliation_details.get("has_ulima_affiliation"))
+    has_engineering_context = bool(affiliation_details.get("has_ulima_engineering_context"))
+
+    if careers_from_affiliation and has_engineering_context:
         return {
             "eligible": True,
             "carrera_raw": "; ".join(careers_from_affiliation),
             "reason": None,
         }
 
+    # Razones separadas para poder auditar bien los rechazados del CSV grande.
+    if not has_ulima_affiliation and not enrichment.get("es_ulima_raw_detected"):
+        return {
+            "eligible": False,
+            "carrera_raw": None,
+            "reason": "REJECT_NO_ULIMA_AFFILIATION: no Universidad de Lima / University of Lima affiliation detected.",
+        }
+
+    if has_ulima_affiliation and not has_engineering_context:
+        return {
+            "eligible": False,
+            "carrera_raw": None,
+            "reason": "REJECT_ULIMA_BUT_NO_ENGINEERING_CONTEXT: ULima affiliation detected, but no Faculty/Career/School/Department of Engineering context detected.",
+        }
+
+    if has_engineering_context and not careers_from_affiliation:
+        return {
+            "eligible": False,
+            "carrera_raw": None,
+            "reason": "REJECT_ENGINEERING_CONTEXT_BUT_NO_TARGET_CAREER: engineering context detected, but no Industrial/Civil/Systems career detected.",
+        }
+
+    if careers_from_affiliation and not has_engineering_context:
+        return {
+            "eligible": False,
+            "carrera_raw": "; ".join(careers_from_affiliation),
+            "reason": "REJECT_TARGET_CAREER_WITHOUT_ULIMA_ENGINEERING_CONTEXT: target career text detected, but not inside a valid ULima engineering affiliation context.",
+        }
+
     return {
         "eligible": False,
         "carrera_raw": None,
-        "reason": "Row excluded: no valid ULima engineering affiliation for Industrial/Civil/Systems.",
+        "reason": "REJECT_NO_VALID_ULIMA_ENGINEERING_AFFILIATION: no valid ULima engineering affiliation for Industrial/Civil/Systems.",
     }
 
 
@@ -4820,6 +4870,106 @@ def parse_csv_text(csv_text: str) -> list[dict]:
     return build_dict_rows_from_csv_rows(best_rows)
 
 
+def insert_scopus_raw_load_row(cursor, run_id: int, source_file_name: str, source_row_number: int, mapped: dict) -> None:
+    cursor.execute(
+        """
+        INSERT INTO stg.scopus_raw_load (
+            run_id,
+            source_row_number,
+            source_file_name,
+            eid,
+            publication_year_raw,
+            scopus_year_raw,
+            publication_type_raw,
+            publication_title_raw,
+            authors_raw,
+            ulima_docentes_raw,
+            ulima_estudiantes_raw,
+            first_author_ulima_raw,
+            conference_journal_raw,
+            indexation_raw,
+            editorial_publication_raw,
+            doi_link_raw,
+            publication_date_raw,
+            publication_date_scopus_raw,
+            revista_raw,
+            conference_raw,
+            publication_status_raw,
+            issn_raw,
+            isbn_raw,
+            scopus_link_raw,
+            alternative_link_raw,
+            category_tematica_raw,
+            area_idic_raw,
+            linea_idic_raw,
+            area_carrera_raw,
+            linea_carrera_raw,
+            carrera_raw,
+            es_scopus_raw,
+            retractado_raw,
+            descontinuado_scopus_raw,
+            metodo_cruce_scopus_raw,
+            abstract_scopus_raw,
+            author_keywords_raw,
+            index_keywords_raw,
+            source_title_raw,
+            document_type_scopus_raw,
+            affiliation_raw,
+            record_hash,
+            is_valid_for_curated,
+            rejection_reason
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            run_id,
+            source_row_number,
+            source_file_name,
+            mapped.get("eid"),
+            mapped.get("publication_year_raw"),
+            mapped.get("scopus_year_raw"),
+            mapped.get("publication_type_raw"),
+            mapped.get("publication_title_raw"),
+            mapped.get("authors_raw"),
+            mapped.get("ulima_docentes_raw"),
+            mapped.get("ulima_estudiantes_raw"),
+            mapped.get("first_author_ulima_raw"),
+            mapped.get("conference_journal_raw"),
+            mapped.get("indexation_raw"),
+            mapped.get("editorial_publication_raw"),
+            mapped.get("doi_link_raw"),
+            mapped.get("publication_date_raw"),
+            mapped.get("publication_date_scopus_raw"),
+            mapped.get("revista_raw"),
+            mapped.get("conference_raw"),
+            mapped.get("publication_status_raw"),
+            mapped.get("issn_raw"),
+            mapped.get("isbn_raw"),
+            mapped.get("scopus_link_raw"),
+            mapped.get("alternative_link_raw"),
+            mapped.get("category_tematica_raw"),
+            mapped.get("area_idic_raw"),
+            mapped.get("linea_idic_raw"),
+            mapped.get("area_carrera_raw"),
+            mapped.get("linea_carrera_raw"),
+            mapped.get("carrera_raw"),
+            mapped.get("es_scopus_raw"),
+            mapped.get("retractado_raw"),
+            mapped.get("descontinuado_scopus_raw"),
+            mapped.get("metodo_cruce_scopus_raw"),
+            mapped.get("abstract_scopus_raw"),
+            mapped.get("author_keywords_raw"),
+            mapped.get("index_keywords_raw"),
+            mapped.get("source_title_raw"),
+            mapped.get("document_type_scopus_raw"),
+            mapped.get("affiliation_raw"),
+            mapped.get("record_hash"),
+            mapped.get("is_valid_for_curated"),
+            mapped.get("rejection_reason"),
+        ),
+    )
+
+
 def insert_rows_to_staging(
     run_id: int,
     source_file_name: str,
@@ -4827,12 +4977,20 @@ def insert_rows_to_staging(
     docentes_ref: list[dict],
     source_row_start: int = 1,
     use_llm: bool | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, list[tuple[int, dict]]]:
+    """
+    Inserta SOLO filas válidas en staging antes del upsert y devuelve rechazados en memoria.
+
+    Motivo: algunos procedimientos de upsert antiguos podrían no filtrar is_valid_for_curated=1.
+    Por seguridad, los rechazados se guardan después del upsert, como auditoría, para no
+    contaminar curated.publications.
+    """
     from mssql_python import connect
 
     sql_conn_str = get_sql_connection_string()
-    inserted = 0
+    inserted_valid = 0
     rejected = 0
+    rejected_audit_rows: list[tuple[int, dict]] = []
 
     with connect(sql_conn_str) as conn:
         cursor = conn.cursor()
@@ -4840,117 +4998,52 @@ def insert_rows_to_staging(
         for idx, row in enumerate(rows, start=source_row_start):
             mapped = map_row_to_staging(row, docentes_ref=docentes_ref, use_llm=use_llm)
 
-            if mapped.get("__skip_insert__"):
-                rejected += 1
-                continue
-
-            cursor.execute(
-                """
-                INSERT INTO stg.scopus_raw_load (
-                    run_id,
-                    source_row_number,
-                    source_file_name,
-                    eid,
-                    publication_year_raw,
-                    scopus_year_raw,
-                    publication_type_raw,
-                    publication_title_raw,
-                    authors_raw,
-                    ulima_docentes_raw,
-                    ulima_estudiantes_raw,
-                    first_author_ulima_raw,
-                    conference_journal_raw,
-                    indexation_raw,
-                    editorial_publication_raw,
-                    doi_link_raw,
-                    publication_date_raw,
-                    publication_date_scopus_raw,
-                    revista_raw,
-                    conference_raw,
-                    publication_status_raw,
-                    issn_raw,
-                    isbn_raw,
-                    scopus_link_raw,
-                    alternative_link_raw,
-                    category_tematica_raw,
-                    area_idic_raw,
-                    linea_idic_raw,
-                    area_carrera_raw,
-                    linea_carrera_raw,
-                    carrera_raw,
-                    es_scopus_raw,
-                    retractado_raw,
-                    descontinuado_scopus_raw,
-                    metodo_cruce_scopus_raw,
-                    abstract_scopus_raw,
-                    author_keywords_raw,
-                    index_keywords_raw,
-                    source_title_raw,
-                    document_type_scopus_raw,
-                    affiliation_raw,
-                    record_hash,
-                    is_valid_for_curated,
-                    rejection_reason
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    idx,
-                    source_file_name,
-                    mapped.get("eid"),
-                    mapped.get("publication_year_raw"),
-                    mapped.get("scopus_year_raw"),
-                    mapped.get("publication_type_raw"),
-                    mapped.get("publication_title_raw"),
-                    mapped.get("authors_raw"),
-                    mapped.get("ulima_docentes_raw"),
-                    mapped.get("ulima_estudiantes_raw"),
-                    mapped.get("first_author_ulima_raw"),
-                    mapped.get("conference_journal_raw"),
-                    mapped.get("indexation_raw"),
-                    mapped.get("editorial_publication_raw"),
-                    mapped.get("doi_link_raw"),
-                    mapped.get("publication_date_raw"),
-                    mapped.get("publication_date_scopus_raw"),
-                    mapped.get("revista_raw"),
-                    mapped.get("conference_raw"),
-                    mapped.get("publication_status_raw"),
-                    mapped.get("issn_raw"),
-                    mapped.get("isbn_raw"),
-                    mapped.get("scopus_link_raw"),
-                    mapped.get("alternative_link_raw"),
-                    mapped.get("category_tematica_raw"),
-                    mapped.get("area_idic_raw"),
-                    mapped.get("linea_idic_raw"),
-                    mapped.get("area_carrera_raw"),
-                    mapped.get("linea_carrera_raw"),
-                    mapped.get("carrera_raw"),
-                    mapped.get("es_scopus_raw"),
-                    mapped.get("retractado_raw"),
-                    mapped.get("descontinuado_scopus_raw"),
-                    mapped.get("metodo_cruce_scopus_raw"),
-                    mapped.get("abstract_scopus_raw"),
-                    mapped.get("author_keywords_raw"),
-                    mapped.get("index_keywords_raw"),
-                    mapped.get("source_title_raw"),
-                    mapped.get("document_type_scopus_raw"),
-                    mapped.get("affiliation_raw"),
-                    mapped.get("record_hash"),
-                    mapped.get("is_valid_for_curated"),
-                    mapped.get("rejection_reason"),
-                ),
-            )
-
-            if mapped.get("is_valid_for_curated") == 1:
-                inserted += 1
+            if mapped.get("is_valid_for_curated") == 1 and not mapped.get("__skip_insert__"):
+                insert_scopus_raw_load_row(cursor, run_id, source_file_name, idx, mapped)
+                inserted_valid += 1
             else:
                 rejected += 1
+                rejected_audit_rows.append((idx, mapped))
 
         conn.commit()
         cursor.close()
 
-    return inserted, rejected
+    return inserted_valid, rejected, rejected_audit_rows
+
+
+def insert_rejected_rows_to_staging(
+    run_id: int,
+    source_file_name: str,
+    rejected_audit_rows: list[tuple[int, dict]],
+) -> int:
+    """
+    Inserta rechazados en stg.scopus_raw_load después del upsert.
+
+    Esto permite auditar por SQL los falsos negativos de afiliación sin arriesgar que
+    el procedimiento de upsert los inserte accidentalmente en curated.publications.
+    """
+    if not rejected_audit_rows:
+        return 0
+
+    from mssql_python import connect
+
+    sql_conn_str = get_sql_connection_string()
+    inserted_rejected = 0
+
+    with connect(sql_conn_str) as conn:
+        cursor = conn.cursor()
+
+        for source_row_number, mapped in rejected_audit_rows:
+            mapped["is_valid_for_curated"] = 0
+            if not mapped.get("rejection_reason"):
+                mapped["rejection_reason"] = "REJECT_UNSPECIFIED"
+            insert_scopus_raw_load_row(cursor, run_id, source_file_name, source_row_number, mapped)
+            inserted_rejected += 1
+
+        conn.commit()
+        cursor.close()
+
+    return inserted_rejected
 
 
 # =========================
@@ -4972,6 +5065,7 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "thematic_llm_configured": is_thematic_llm_configured(),
             "thematic_llm_enabled": resolve_llm_enabled(),
             "scopus_max_rows_per_run": get_default_max_rows_per_run(),
+            "save_rejected_to_staging_default": resolve_save_rejected_enabled(),
         }
 
         return func.HttpResponse(
@@ -5149,6 +5243,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         end_row = parse_positive_int(req.params.get("end_row"), "end_row")
         max_rows = parse_positive_int(req.params.get("max_rows"), "max_rows")
         use_llm = resolve_llm_enabled(req.params.get("llm"))
+        save_rejected_to_staging = resolve_save_rejected_enabled(req.params.get("save_rejected"))
 
         run_id = create_pipeline_run(
             trigger_type="MANUAL",
@@ -5169,7 +5264,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         records_read = len(rows)
-        records_inserted, records_rejected = insert_rows_to_staging(
+        records_inserted, records_rejected, rejected_audit_rows = insert_rows_to_staging(
             run_id=run_id,
             source_file_name=blob_name,
             rows=rows,
@@ -5179,6 +5274,16 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         execute_upsert_from_staging(run_id)
+
+        records_rejected_saved_to_staging = 0
+        if save_rejected_to_staging:
+            records_rejected_saved_to_staging = insert_rejected_rows_to_staging(
+                run_id=run_id,
+                source_file_name=blob_name,
+                rejected_audit_rows=rejected_audit_rows,
+            )
+
+        total_rows_inserted_to_staging = records_inserted + records_rejected_saved_to_staging
 
         processed_name = f"processed/{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{os.path.basename(blob_name)}"
         upload_text_blob(processed_container, processed_name, csv_text)
@@ -5192,8 +5297,11 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             "start_row": effective_start_row,
             "end_row": effective_end_row,
             "records_read": records_read,
-            "records_inserted_to_staging": records_inserted,
+            "records_inserted_to_staging": total_rows_inserted_to_staging,
+            "records_valid_for_curated": records_inserted,
             "records_rejected": records_rejected,
+            "records_rejected_saved_to_staging": records_rejected_saved_to_staging,
+            "save_rejected_to_staging": save_rejected_to_staging,
             "thematic_llm_enabled": use_llm,
             "utc_now": utc_now_iso(),
             "status": "SUCCESS",
@@ -5225,8 +5333,11 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
                     "start_row": effective_start_row,
                     "end_row": effective_end_row,
                     "records_read": records_read,
-                    "records_inserted_to_staging": records_inserted,
+                    "records_inserted_to_staging": total_rows_inserted_to_staging,
+                    "records_valid_for_curated": records_inserted,
                     "records_rejected": records_rejected,
+                    "records_rejected_saved_to_staging": records_rejected_saved_to_staging,
+                    "save_rejected_to_staging": save_rejected_to_staging,
                     "thematic_llm_enabled": use_llm,
                     "utc_now": utc_now_iso(),
                 },

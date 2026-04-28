@@ -209,9 +209,26 @@ def get_ai_taxonomy_max_calls_per_run() -> int | None:
 def should_ai_taxonomy_review_reject() -> bool:
     """
     Si la IA taxonómica no puede clasificar con seguridad, el registro no debe
-    pasar a curated. Default true: preferimos REVIEW antes que mala taxonomía.
+    pasar a curated. Default true en el modo conservador.
+
+    Run89: si AI_TAXONOMY_FORCE_DECISION=true, este valor queda subordinado
+    porque el pipeline buscará una taxonomía forzada antes de generar REVIEW.
     """
     return get_bool_setting("AI_TAXONOMY_REVIEW_TO_REJECTED", default=True)
+
+
+def should_ai_taxonomy_force_decision() -> bool:
+    """Modo sin revisión manual para taxonomía."""
+    return get_bool_setting("AI_TAXONOMY_FORCE_DECISION", default=True)
+
+
+def get_ai_taxonomy_forced_min_confidence() -> float:
+    raw = os.environ.get("AI_TAXONOMY_FORCED_MIN_CONFIDENCE", "0.50")
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.50
+    return max(0.0, min(1.0, value))
 
 
 def get_ingest_singleton_lock_enabled() -> bool:
@@ -5597,6 +5614,174 @@ def build_ai_taxonomy_review_result(reason: str, raw: dict | None = None, confid
     return result
 
 
+def build_ai_taxonomy_forced_prompt(
+    carrera: str,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+    previous_raw_output: dict | None = None,
+    previous_reason: str | None = None,
+) -> str:
+    payload = {
+        "task": "force_best_fit_taxonomy_for_ulima_engineering_publication",
+        "allowed_decisions": ["ACCEPT_BEST_FIT"],
+        "fixed_career": carrera,
+        "career_catalog_for_fixed_career": CAREER_AREA_LINE_CATALOG.get(carrera, {}),
+        "idic_catalog": IDIC_CATEGORY_AREA_LINE_CATALOG,
+        "previous_classifier_result": previous_raw_output or {},
+        "previous_reason": previous_reason,
+        "article": {
+            "title": clip_text(title_value, 2200),
+            "abstract_scopus": clip_text(abstract_value, 9000),
+            "author_keywords": clip_text(author_keywords_value, 2500),
+            "index_keywords": clip_text(index_keywords_value, 2500),
+            "source_title": clip_text(source_title_value, 1200),
+        },
+        "output_schema": {
+            "decision": "ACCEPT_BEST_FIT",
+            "area_carrera_raw": "string from career_catalog_for_fixed_career",
+            "linea_carrera_raw": "string from career_catalog_for_fixed_career",
+            "category_tematica_raw": "string from idic_catalog",
+            "area_idic_raw": "string from idic_catalog",
+            "linea_idic_raw": "string from idic_catalog",
+            "confidence": "number 0..1",
+            "rationale": "short Spanish explanation, max 70 words",
+            "evidence": ["short strings from title/abstract/keywords"]
+        },
+        "rules": [
+            "No devuelvas REVIEW. Debes escoger el mejor ajuste defendible dentro de los catálogos cerrados.",
+            "La carrera fija ya fue resuelta por elegibilidad. No la cambies.",
+            "Si el encaje no es perfecto, elige la opción más cercana y baja la confianza, pero conserva una taxonomía válida.",
+            "Copia exactamente los valores del catálogo. No inventes categorías, áreas ni líneas.",
+            "La línea de carrera debe pertenecer al área elegida y a la carrera fija.",
+            "La línea IDIC debe pertenecer al área IDIC elegida y a la categoría temática elegida.",
+            "Usa el abstract como evidencia principal; título y keywords como soporte.",
+            "Para contaminación, agua, aire, suelo, cementerios, residuos, SARS-CoV-2 ambiental, remediación o patógenos, favorece Desarrollo sostenible y medioambiente si es el mejor ajuste.",
+            "Para teletrabajo, knowledge complexity, shadow IT, adoption, governance o knowledge management, favorece gestión de conocimiento o tecnologías y gestión de la información según el catálogo.",
+            "Para LiDAR, UAV, point cloud, fotogrametría, georreferenciación o procesamiento visual, puede corresponder a geotecnia computacional y/o visión computacional IDIC si el abstract lo sustenta.",
+            "Devuelve SOLO JSON válido, sin markdown ni texto adicional."
+        ],
+    }
+    return (
+        "Eres un adjudicador académico senior. El primer clasificador fue conservador, pero este pipeline no permite revisión manual. "
+        "Tu tarea es emitir una taxonomía final de mejor ajuste, válida y auditable, usando solo catálogos cerrados.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def build_forced_taxonomy_from_deterministic_best_fit(
+    carrera: str,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+    reason: str,
+) -> dict:
+    career = classify_career_dimensions_force_best(
+        carrera=carrera,
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+    )
+    idic = classify_idic_dimensions_force_best(
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+    )
+    result = build_thematic_empty_result()
+    result.update(career)
+    result.update(idic)
+    result["confidence"] = None
+    result["classification_mode"] = "ai_taxonomy_forced_deterministic_best_fit"
+    result["justification"] = (
+        "Taxonomía automática de mejor ajuste aplicada porque la IA taxonómica no produjo una decisión final segura. "
+        f"Motivo previo: {reason}"
+    )
+    result["thematic_review_rejected"] = False
+    result["thematic_review_rejection_reason"] = None
+    return result
+
+
+def validate_ai_taxonomy_forced_output(carrera: str, raw_output: dict | None) -> dict:
+    if not raw_output:
+        return build_ai_taxonomy_review_result("FORCED_AI_FAILED_OR_NON_JSON")
+
+    decision = str(raw_output.get("decision") or "").strip().upper()
+    confidence = parse_float_or_none(raw_output.get("confidence"))
+    rationale = str(raw_output.get("rationale") or "").strip() or None
+
+    if decision not in {"ACCEPT_BEST_FIT", "ACCEPT"}:
+        return build_ai_taxonomy_review_result(
+            reason=f"FORCED_AI_INVALID_DECISION_{decision or 'EMPTY'}",
+            raw=raw_output,
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    if confidence is not None and confidence < get_ai_taxonomy_forced_min_confidence():
+        return build_ai_taxonomy_review_result(
+            reason=f"FORCED_AI_LOW_CONFIDENCE_BELOW_THRESHOLD_{get_ai_taxonomy_forced_min_confidence():.2f}",
+            raw=raw_output,
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    result = build_thematic_empty_result()
+    result["confidence"] = confidence
+    result["justification"] = rationale
+    result["classification_mode"] = "ai_taxonomy_forced_best_fit"
+
+    area_carrera = coerce_choice(raw_output.get("area_carrera_raw"), get_allowed_career_areas(carrera))
+    linea_carrera = coerce_choice(raw_output.get("linea_carrera_raw"), get_allowed_career_lines(carrera))
+    if linea_carrera and not area_carrera:
+        area_carrera = coerce_area_carrera_from_linea(carrera, linea_carrera)
+
+    category_tematica = coerce_choice(raw_output.get("category_tematica_raw"), get_allowed_idic_categories())
+    area_idic = coerce_choice(raw_output.get("area_idic_raw"), get_allowed_idic_areas(category_tematica))
+    if not area_idic:
+        area_idic = coerce_choice(raw_output.get("area_idic_raw"), get_allowed_idic_areas())
+    linea_idic = coerce_choice(raw_output.get("linea_idic_raw"), get_allowed_idic_lines(category_tematica, area_idic))
+    if not linea_idic:
+        linea_idic = coerce_choice(raw_output.get("linea_idic_raw"), get_allowed_idic_lines())
+    if linea_idic and not area_idic:
+        area_idic = coerce_area_idic_from_linea(linea_idic)
+    if area_idic and not category_tematica:
+        category_tematica = coerce_category_tematica_from_area(area_idic)
+
+    if not is_valid_career_area_line(carrera, area_carrera, linea_carrera):
+        return build_ai_taxonomy_review_result(
+            reason="FORCED_AI_INVALID_CAREER_AREA_LINE",
+            raw=raw_output,
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    if not is_valid_idic_triplet(category_tematica, area_idic, linea_idic):
+        return build_ai_taxonomy_review_result(
+            reason="FORCED_AI_INVALID_IDIC_TRIPLET",
+            raw=raw_output,
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    result["area_carrera_raw"] = area_carrera
+    result["linea_carrera_raw"] = linea_carrera
+    result["category_tematica_raw"] = category_tematica
+    result["area_idic_raw"] = area_idic
+    result["linea_idic_raw"] = linea_idic
+    result["thematic_review_rejected"] = False
+    result["thematic_review_rejection_reason"] = None
+    result["ai_taxonomy_raw"] = raw_output
+    return result
+
+
 def validate_ai_taxonomy_output(carrera: str, raw_output: dict | None) -> dict:
     if not raw_output:
         return build_ai_taxonomy_review_result("AI_FAILED_OR_NON_JSON")
@@ -5676,13 +5861,32 @@ def classify_taxonomy_with_ai(
     source_title_value: str | None,
 ) -> dict:
     if not is_thematic_llm_configured():
+        if should_ai_taxonomy_force_decision():
+            return build_forced_taxonomy_from_deterministic_best_fit(
+                carrera=carrera,
+                title_value=title_value,
+                abstract_value=abstract_value,
+                author_keywords_value=author_keywords_value,
+                index_keywords_value=index_keywords_value,
+                source_title_value=source_title_value,
+                reason="AI_NOT_CONFIGURED",
+            )
         return build_ai_taxonomy_review_result("AI_NOT_CONFIGURED")
 
     call_slot = reserve_ai_taxonomy_call_slot()
     if not call_slot.get("allowed"):
-        return build_ai_taxonomy_review_result(
-            f"AI_SKIPPED_MAX_CALLS_PER_RUN_{call_slot.get('calls_used')}_OF_{call_slot.get('max_calls')}"
-        )
+        reason = f"AI_SKIPPED_MAX_CALLS_PER_RUN_{call_slot.get('calls_used')}_OF_{call_slot.get('max_calls')}"
+        if should_ai_taxonomy_force_decision():
+            return build_forced_taxonomy_from_deterministic_best_fit(
+                carrera=carrera,
+                title_value=title_value,
+                abstract_value=abstract_value,
+                author_keywords_value=author_keywords_value,
+                index_keywords_value=index_keywords_value,
+                source_title_value=source_title_value,
+                reason=reason,
+            )
+        return build_ai_taxonomy_review_result(reason)
 
     prompt = build_ai_taxonomy_prompt(
         carrera=carrera,
@@ -5697,8 +5901,47 @@ def classify_taxonomy_with_ai(
         throttle_seconds=get_ai_taxonomy_call_delay_seconds(),
         call_label="ai_taxonomy_classifier",
     )
-    return validate_ai_taxonomy_output(carrera, raw_output)
+    first_pass = validate_ai_taxonomy_output(carrera, raw_output)
 
+    if not first_pass.get("thematic_review_rejected"):
+        return first_pass
+
+    if not should_ai_taxonomy_force_decision():
+        return first_pass
+
+    previous_reason = first_pass.get("thematic_review_rejection_reason") or "FIRST_PASS_REVIEW"
+
+    forced_slot = reserve_ai_taxonomy_call_slot()
+    if forced_slot.get("allowed"):
+        forced_prompt = build_ai_taxonomy_forced_prompt(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+            previous_raw_output=raw_output,
+            previous_reason=previous_reason,
+        )
+        forced_raw = call_openai_responses_json(
+            forced_prompt,
+            throttle_seconds=get_ai_taxonomy_call_delay_seconds(),
+            call_label="ai_taxonomy_forced_best_fit",
+        )
+        forced_result = validate_ai_taxonomy_forced_output(carrera, forced_raw)
+        if not forced_result.get("thematic_review_rejected"):
+            return forced_result
+        previous_reason = forced_result.get("thematic_review_rejection_reason") or previous_reason
+
+    return build_forced_taxonomy_from_deterministic_best_fit(
+        carrera=carrera,
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+        reason=previous_reason,
+    )
 
 def classify_thematic_fields(
     carrera: str | None,
@@ -7622,6 +7865,8 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "ai_taxonomy_call_delay_seconds": get_ai_taxonomy_call_delay_seconds(),
             "ai_taxonomy_max_calls_per_run": get_ai_taxonomy_max_calls_per_run(),
             "ai_taxonomy_review_to_rejected": should_ai_taxonomy_review_reject(),
+            "ai_taxonomy_force_decision": should_ai_taxonomy_force_decision(),
+            "ai_taxonomy_forced_min_confidence": get_ai_taxonomy_forced_min_confidence(),
             "career_ambiguity_ai_configured": is_thematic_llm_configured(),
             "career_ambiguity_ai_enabled": resolve_career_ambiguity_ai_enabled(),
             "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
@@ -7638,7 +7883,7 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "engineering_generic_inference_enabled": True,
             "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
             "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
-            "classification_guardrails_version": "v10_run88_ai_taxonomy_classifier_closed_catalog",
+            "classification_guardrails_version": "v11_run89_ai_taxonomy_force_decision_no_manual_review",
             "post_upsert_reactivation_enabled": True,
             "post_upsert_deactivation_from_rejected_enabled": True,
         }

@@ -174,6 +174,45 @@ def should_send_thematic_review_to_rejected() -> bool:
     return get_bool_setting("THEMATIC_REVIEW_SEND_UNSAFE_TO_REVIEW", default=False)
 
 
+def resolve_ai_taxonomy_classifier_enabled(request_value: str | None = None) -> bool:
+    """
+    IA principal para clasificar la taxonomía completa de registros ya aceptados
+    como Ingeniería ULima: área/línea de carrera + categoría/área/línea IDIC.
+
+    Es independiente de THEMATIC_LLM_ENABLED. Cuando está activo, la IA clasifica
+    todos los registros válidos del lote con catálogo cerrado; las reglas quedan
+    como fallback solo cuando esta opción está apagada.
+    """
+    if request_value is not None and str(request_value).strip() != "":
+        return parse_bool(request_value, default=False)
+    return get_bool_setting("AI_TAXONOMY_CLASSIFIER_ENABLED", default=False)
+
+
+def get_ai_taxonomy_min_confidence() -> float:
+    raw = os.environ.get("AI_TAXONOMY_MIN_CONFIDENCE", "0.78")
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.78
+    return max(0.0, min(1.0, value))
+
+
+def get_ai_taxonomy_call_delay_seconds() -> float:
+    raw = os.environ.get("AI_TAXONOMY_CALL_DELAY_SECONDS", "8.0")
+    return min(60.0, parse_nonnegative_float(raw, default=8.0))
+
+
+def get_ai_taxonomy_max_calls_per_run() -> int | None:
+    return parse_optional_positive_int_setting("AI_TAXONOMY_MAX_CALLS_PER_RUN")
+
+
+def should_ai_taxonomy_review_reject() -> bool:
+    """
+    Si la IA taxonómica no puede clasificar con seguridad, el registro no debe
+    pasar a curated. Default true: preferimos REVIEW antes que mala taxonomía.
+    """
+    return get_bool_setting("AI_TAXONOMY_REVIEW_TO_REJECTED", default=True)
+
 
 def get_ingest_singleton_lock_enabled() -> bool:
     """Evita ejecuciones simultáneas del ingest con un lock distribuido en SQL."""
@@ -283,12 +322,14 @@ def release_scopus_ingest_singleton_lock(lock_conn) -> None:
 _LAST_AZURE_OPENAI_CALL_AT = 0.0
 _CAREER_AI_CALLS_THIS_RUN = 0
 _THEMATIC_REVIEW_AI_CALLS_THIS_RUN = 0
+_AI_TAXONOMY_CALLS_THIS_RUN = 0
 
 
 def reset_ai_runtime_counters() -> None:
-    global _CAREER_AI_CALLS_THIS_RUN, _THEMATIC_REVIEW_AI_CALLS_THIS_RUN
+    global _CAREER_AI_CALLS_THIS_RUN, _THEMATIC_REVIEW_AI_CALLS_THIS_RUN, _AI_TAXONOMY_CALLS_THIS_RUN
     _CAREER_AI_CALLS_THIS_RUN = 0
     _THEMATIC_REVIEW_AI_CALLS_THIS_RUN = 0
+    _AI_TAXONOMY_CALLS_THIS_RUN = 0
 
 
 def get_career_ai_calls_this_run() -> int:
@@ -297,6 +338,29 @@ def get_career_ai_calls_this_run() -> int:
 
 def get_thematic_review_ai_calls_this_run() -> int:
     return int(_THEMATIC_REVIEW_AI_CALLS_THIS_RUN)
+
+
+def get_ai_taxonomy_calls_this_run() -> int:
+    return int(_AI_TAXONOMY_CALLS_THIS_RUN)
+
+
+def reserve_ai_taxonomy_call_slot() -> dict:
+    global _AI_TAXONOMY_CALLS_THIS_RUN
+
+    max_calls = get_ai_taxonomy_max_calls_per_run()
+    if max_calls is not None and _AI_TAXONOMY_CALLS_THIS_RUN >= max_calls:
+        return {
+            "allowed": False,
+            "calls_used": _AI_TAXONOMY_CALLS_THIS_RUN,
+            "max_calls": max_calls,
+        }
+
+    _AI_TAXONOMY_CALLS_THIS_RUN += 1
+    return {
+        "allowed": True,
+        "calls_used": _AI_TAXONOMY_CALLS_THIS_RUN,
+        "max_calls": max_calls,
+    }
 
 
 def reserve_thematic_review_ai_call_slot() -> dict:
@@ -486,6 +550,29 @@ def validate_career_ai_runtime_configuration(use_career_ai: bool) -> None:
     if missing:
         raise RuntimeError(
             "career_ai=true was requested, but Azure OpenAI is not fully configured. "
+            "Missing settings: " + ", ".join(missing)
+        )
+
+
+def validate_ai_taxonomy_runtime_configuration(use_ai_taxonomy: bool) -> None:
+    """
+    Si se solicita ai_taxonomy=true, la clasificación semántica no debe caer
+    silenciosamente al clasificador por reglas.
+    """
+    if not use_ai_taxonomy:
+        return
+
+    missing: list[str] = []
+    if not os.environ.get("AZURE_OPENAI_API_KEY"):
+        missing.append("AZURE_OPENAI_API_KEY")
+    if not (os.environ.get("AZURE_OPENAI_BASE_URL") or os.environ.get("AZURE_OPENAI_ENDPOINT")):
+        missing.append("AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_BASE_URL")
+    if not os.environ.get("AZURE_OPENAI_RESPONSES_MODEL"):
+        missing.append("AZURE_OPENAI_RESPONSES_MODEL")
+
+    if missing:
+        raise RuntimeError(
+            "ai_taxonomy=true was requested, but Azure OpenAI is not fully configured. "
             "Missing settings: " + ", ".join(missing)
         )
 
@@ -5436,6 +5523,183 @@ def apply_thematic_review_ai_result(carrera: str, merged: dict, ai_result: dict)
 
     return merged, None
 
+
+def build_ai_taxonomy_prompt(
+    carrera: str,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> str:
+    """Prompt único para clasificar taxonomía completa con catálogo cerrado."""
+    payload = {
+        "task": "classify_ulima_engineering_publication_taxonomy",
+        "allowed_decisions": ["ACCEPT", "REVIEW"],
+        "fixed_career": carrera,
+        "career_catalog_for_fixed_career": CAREER_AREA_LINE_CATALOG.get(carrera, {}),
+        "idic_catalog": IDIC_CATEGORY_AREA_LINE_CATALOG,
+        "article": {
+            "title": clip_text(title_value, 2200),
+            "abstract_scopus": clip_text(abstract_value, 9000),
+            "author_keywords": clip_text(author_keywords_value, 2500),
+            "index_keywords": clip_text(index_keywords_value, 2500),
+            "source_title": clip_text(source_title_value, 1200),
+        },
+        "output_schema": {
+            "decision": "ACCEPT|REVIEW",
+            "area_carrera_raw": "string from career_catalog_for_fixed_career|null",
+            "linea_carrera_raw": "string from career_catalog_for_fixed_career|null",
+            "category_tematica_raw": "string from idic_catalog|null",
+            "area_idic_raw": "string from idic_catalog|null",
+            "linea_idic_raw": "string from idic_catalog|null",
+            "confidence": "number 0..1",
+            "rationale": "short Spanish explanation, max 55 words",
+            "evidence": ["short strings from title/abstract/keywords"]
+        },
+        "rules": [
+            "La carrera fija ya fue resuelta por otro proceso. No la cambies ni la discutas.",
+            "Clasifica obligatoriamente dos dimensiones: (1) área/línea de carrera y (2) categoría/área/línea IDIC.",
+            "Usa el abstract_scopus como evidencia principal. Usa título y keywords como apoyo. Usa source_title solo como evidencia débil.",
+            "Devuelve ACCEPT solo si puedes elegir valores exactos del catálogo cerrado con evidencia suficiente.",
+            "Devuelve REVIEW si la clasificación no es defendible, si el artículo es demasiado ambiguo o si no hay una línea claramente dominante.",
+            "No inventes categorías, áreas ni líneas. Copia los valores exactamente como aparecen en los catálogos.",
+            "La línea de carrera debe pertenecer al área elegida y a la carrera fija.",
+            "La línea IDIC debe pertenecer al área IDIC elegida y a la categoría temática elegida.",
+            "No uses Realidad virtual y aumentada si el artículo no trata explícitamente AR, VR, mixed reality o entornos inmersivos.",
+            "No uses Visión computacional si el artículo no trata explícitamente imágenes, video, detección, visión, LiDAR, point cloud, fotogrametría o procesamiento visual.",
+            "Para remediación ambiental, residuos, contaminación, agua, suelo, adsorción, petróleo o microorganismos, favorece Desarrollo sostenible y medioambiente cuando corresponda.",
+            "Para Shadow IT, governance, knowledge management, telecommuting o adoption de sistemas de información, no uses Visión computacional ni AR/VR salvo evidencia explícita.",
+            "Para Lean, 5S, TPM, Kanban, inventarios, almacenes, logística, supply chain o mejora de procesos, clasifica la carrera e IDIC según operaciones/innovación, no como tecnología visual.",
+            "Devuelve SOLO JSON válido, sin markdown ni texto adicional."
+        ],
+    }
+    return (
+        "Eres un clasificador académico senior para producción científica de la Facultad de Ingeniería de la Universidad de Lima. "
+        "Debes clasificar taxonomía con criterio conservador, usando únicamente catálogos cerrados.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def build_ai_taxonomy_review_result(reason: str, raw: dict | None = None, confidence=None, rationale: str | None = None) -> dict:
+    result = build_thematic_empty_result()
+    result["classification_mode"] = "ai_taxonomy_review"
+    result["confidence"] = confidence
+    result["justification"] = rationale
+    result["thematic_review_rejected"] = should_ai_taxonomy_review_reject()
+    result["thematic_review_rejection_reason"] = (
+        "REVIEW_AI_TAXONOMY_CLASSIFICATION: AI taxonomy classifier did not produce a safe accepted taxonomy. "
+        f"reason={reason}; confidence={'NULL' if confidence is None else confidence}; "
+        f"rationale={(rationale or '')[:500]}"
+    )
+    if raw is not None:
+        result["ai_taxonomy_raw"] = raw
+    return result
+
+
+def validate_ai_taxonomy_output(carrera: str, raw_output: dict | None) -> dict:
+    if not raw_output:
+        return build_ai_taxonomy_review_result("AI_FAILED_OR_NON_JSON")
+
+    decision = str(raw_output.get("decision") or "").strip().upper()
+    confidence = parse_float_or_none(raw_output.get("confidence"))
+    rationale = str(raw_output.get("rationale") or "").strip() or None
+
+    if decision != "ACCEPT":
+        return build_ai_taxonomy_review_result(
+            reason=f"AI_{decision or 'INVALID_DECISION'}",
+            raw=raw_output,
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    if confidence is None or confidence < get_ai_taxonomy_min_confidence():
+        return build_ai_taxonomy_review_result(
+            reason=f"AI_LOW_CONFIDENCE_BELOW_THRESHOLD_{get_ai_taxonomy_min_confidence():.2f}",
+            raw=raw_output,
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    result = build_thematic_empty_result()
+    result["confidence"] = confidence
+    result["justification"] = rationale
+    result["classification_mode"] = "ai_taxonomy_classifier"
+
+    area_carrera = coerce_choice(raw_output.get("area_carrera_raw"), get_allowed_career_areas(carrera))
+    linea_carrera = coerce_choice(raw_output.get("linea_carrera_raw"), get_allowed_career_lines(carrera))
+    if linea_carrera and not area_carrera:
+        area_carrera = coerce_area_carrera_from_linea(carrera, linea_carrera)
+
+    category_tematica = coerce_choice(raw_output.get("category_tematica_raw"), get_allowed_idic_categories())
+    area_idic = coerce_choice(raw_output.get("area_idic_raw"), get_allowed_idic_areas(category_tematica))
+    if not area_idic:
+        area_idic = coerce_choice(raw_output.get("area_idic_raw"), get_allowed_idic_areas())
+    linea_idic = coerce_choice(raw_output.get("linea_idic_raw"), get_allowed_idic_lines(category_tematica, area_idic))
+    if not linea_idic:
+        linea_idic = coerce_choice(raw_output.get("linea_idic_raw"), get_allowed_idic_lines())
+    if linea_idic and not area_idic:
+        area_idic = coerce_area_idic_from_linea(linea_idic)
+    if area_idic and not category_tematica:
+        category_tematica = coerce_category_tematica_from_area(area_idic)
+
+    if not is_valid_career_area_line(carrera, area_carrera, linea_carrera):
+        return build_ai_taxonomy_review_result(
+            reason="AI_INVALID_CAREER_AREA_LINE",
+            raw=raw_output,
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    if not is_valid_idic_triplet(category_tematica, area_idic, linea_idic):
+        return build_ai_taxonomy_review_result(
+            reason="AI_INVALID_IDIC_TRIPLET",
+            raw=raw_output,
+            confidence=confidence,
+            rationale=rationale,
+        )
+
+    result["area_carrera_raw"] = area_carrera
+    result["linea_carrera_raw"] = linea_carrera
+    result["category_tematica_raw"] = category_tematica
+    result["area_idic_raw"] = area_idic
+    result["linea_idic_raw"] = linea_idic
+    return result
+
+
+def classify_taxonomy_with_ai(
+    carrera: str,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+) -> dict:
+    if not is_thematic_llm_configured():
+        return build_ai_taxonomy_review_result("AI_NOT_CONFIGURED")
+
+    call_slot = reserve_ai_taxonomy_call_slot()
+    if not call_slot.get("allowed"):
+        return build_ai_taxonomy_review_result(
+            f"AI_SKIPPED_MAX_CALLS_PER_RUN_{call_slot.get('calls_used')}_OF_{call_slot.get('max_calls')}"
+        )
+
+    prompt = build_ai_taxonomy_prompt(
+        carrera=carrera,
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+    )
+    raw_output = call_openai_responses_json(
+        prompt,
+        throttle_seconds=get_ai_taxonomy_call_delay_seconds(),
+        call_label="ai_taxonomy_classifier",
+    )
+    return validate_ai_taxonomy_output(carrera, raw_output)
+
+
 def classify_thematic_fields(
     carrera: str | None,
     title_value: str | None,
@@ -5445,16 +5709,15 @@ def classify_thematic_fields(
     source_title_value: str | None,
     use_llm: bool | None = None,
     use_thematic_review_ai: bool | None = None,
+    use_ai_taxonomy: bool | None = None,
 ) -> dict:
     """
-    Clasificación temática optimizada para carga masiva.
+    Clasificación temática.
 
-    Cambio clave:
-    - Antes: LLM primero, luego reglas/hints.
-    - Ahora: reglas/hints primero, LLM solo como fallback opcional.
-
-    Esto reduce drásticamente llamadas a Azure OpenAI, evita 429 en cargas grandes
-    y mantiene el fallback obligatorio para no dejar NULLs temáticos en registros aceptados.
+    Run88:
+    - Si AI_TAXONOMY_CLASSIFIER_ENABLED / ai_taxonomy=true está activo, la IA
+      clasifica TODOS los registros válidos con catálogo cerrado.
+    - El clasificador por reglas queda como fallback solo cuando ai_taxonomy está apagado.
     """
     merged = build_thematic_empty_result()
 
@@ -5465,6 +5728,18 @@ def classify_thematic_fields(
         use_llm = resolve_llm_enabled()
     if use_thematic_review_ai is None:
         use_thematic_review_ai = resolve_thematic_review_ai_enabled()
+    if use_ai_taxonomy is None:
+        use_ai_taxonomy = resolve_ai_taxonomy_classifier_enabled()
+
+    if use_ai_taxonomy:
+        return classify_taxonomy_with_ai(
+            carrera=carrera,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+        )
 
     career_fields = ["area_carrera_raw", "linea_carrera_raw"]
     idic_fields = ["category_tematica_raw", "area_idic_raw", "linea_idic_raw"]
@@ -6874,6 +7149,7 @@ def map_row_to_staging(
     use_llm: bool | None = None,
     use_career_ai: bool = False,
     use_thematic_review_ai: bool = False,
+    use_ai_taxonomy: bool = False,
 ) -> dict:
     mapped = {}
 
@@ -7014,6 +7290,7 @@ def map_row_to_staging(
             source_title_value=mapped.get("source_title_raw"),
             use_llm=use_llm,
             use_thematic_review_ai=use_thematic_review_ai,
+            use_ai_taxonomy=use_ai_taxonomy,
         )
 
         if not mapped.get("area_carrera_raw") and thematic.get("area_carrera_raw"):
@@ -7238,6 +7515,7 @@ def insert_rows_to_staging(
     use_llm: bool | None = None,
     use_career_ai: bool = False,
     use_thematic_review_ai: bool = False,
+    use_ai_taxonomy: bool = False,
 ) -> tuple[int, int, list[tuple[int, dict]]]:
     """
     Inserta SOLO filas válidas en staging antes del upsert y devuelve rechazados en memoria.
@@ -7263,6 +7541,7 @@ def insert_rows_to_staging(
                 use_llm=use_llm,
                 use_career_ai=use_career_ai,
                 use_thematic_review_ai=use_thematic_review_ai,
+                use_ai_taxonomy=use_ai_taxonomy,
             )
 
             if mapped.get("is_valid_for_curated") == 1 and not mapped.get("__skip_insert__"):
@@ -7337,6 +7616,12 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "thematic_review_ai_call_delay_seconds": get_thematic_review_ai_call_delay_seconds(),
             "thematic_review_ai_max_calls_per_run": get_thematic_review_ai_max_calls_per_run(),
             "thematic_review_send_unsafe_to_review": should_send_thematic_review_to_rejected(),
+            "ai_taxonomy_classifier_configured": is_thematic_llm_configured(),
+            "ai_taxonomy_classifier_enabled": resolve_ai_taxonomy_classifier_enabled(),
+            "ai_taxonomy_min_confidence": get_ai_taxonomy_min_confidence(),
+            "ai_taxonomy_call_delay_seconds": get_ai_taxonomy_call_delay_seconds(),
+            "ai_taxonomy_max_calls_per_run": get_ai_taxonomy_max_calls_per_run(),
+            "ai_taxonomy_review_to_rejected": should_ai_taxonomy_review_reject(),
             "career_ambiguity_ai_configured": is_thematic_llm_configured(),
             "career_ambiguity_ai_enabled": resolve_career_ambiguity_ai_enabled(),
             "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
@@ -7353,7 +7638,7 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "engineering_generic_inference_enabled": True,
             "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
             "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
-            "classification_guardrails_version": "v9_run84_clean_40_idic_restore_and_batch_guardrails",
+            "classification_guardrails_version": "v10_run88_ai_taxonomy_classifier_closed_catalog",
             "post_upsert_reactivation_enabled": True,
             "post_upsert_deactivation_from_rejected_enabled": True,
         }
@@ -7564,6 +7849,11 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             request_payload,
             ["theme_review_ai", "thematic_review_ai", "thematicReviewAi", "review_ai", "use_thematic_review_ai"],
         )
+        ai_taxonomy_value = get_request_value(
+            req,
+            request_payload,
+            ["ai_taxonomy", "taxonomy_ai", "aiTaxonomy", "ai_taxonomy_classifier", "use_ai_taxonomy"],
+        )
         save_rejected_value = get_request_value(
             req,
             request_payload,
@@ -7573,10 +7863,12 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         use_llm = resolve_llm_enabled(llm_value)
         use_career_ai = resolve_career_ambiguity_ai_enabled(career_ai_value)
         use_thematic_review_ai = resolve_thematic_review_ai_enabled(thematic_review_ai_value)
+        use_ai_taxonomy = resolve_ai_taxonomy_classifier_enabled(ai_taxonomy_value)
         save_rejected_to_staging = resolve_save_rejected_enabled(save_rejected_value)
 
         reset_ai_runtime_counters()
         validate_career_ai_runtime_configuration(use_career_ai)
+        validate_ai_taxonomy_runtime_configuration(use_ai_taxonomy)
 
         # Candado distribuido: impide corridas simultáneas que saturan Azure OpenAI.
         ingest_lock_conn = acquire_scopus_ingest_singleton_lock()
@@ -7635,6 +7927,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             use_llm=use_llm,
             use_career_ai=use_career_ai,
             use_thematic_review_ai=use_thematic_review_ai,
+            use_ai_taxonomy=use_ai_taxonomy,
         )
 
         execute_upsert_from_staging(run_id)
@@ -7678,6 +7971,12 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             "thematic_review_ai_call_delay_seconds": get_thematic_review_ai_call_delay_seconds(),
             "thematic_review_ai_max_calls_per_run": get_thematic_review_ai_max_calls_per_run(),
             "thematic_review_ai_calls_this_run": get_thematic_review_ai_calls_this_run(),
+            "ai_taxonomy_classifier_enabled": use_ai_taxonomy,
+            "ai_taxonomy_requested_value": ai_taxonomy_value,
+            "ai_taxonomy_min_confidence": get_ai_taxonomy_min_confidence(),
+            "ai_taxonomy_call_delay_seconds": get_ai_taxonomy_call_delay_seconds(),
+            "ai_taxonomy_max_calls_per_run": get_ai_taxonomy_max_calls_per_run(),
+            "ai_taxonomy_calls_this_run": get_ai_taxonomy_calls_this_run(),
             "career_ambiguity_ai_enabled": use_career_ai,
             "career_ambiguity_ai_requested_value": career_ai_value,
             "career_ambiguity_ai_configured": is_thematic_llm_configured(),
@@ -7729,6 +8028,11 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
                     "records_rejected_saved_to_staging": records_rejected_saved_to_staging,
                     "save_rejected_to_staging": save_rejected_to_staging,
                     "thematic_llm_enabled": use_llm,
+                    "ai_taxonomy_classifier_enabled": use_ai_taxonomy,
+                    "ai_taxonomy_min_confidence": get_ai_taxonomy_min_confidence(),
+                    "ai_taxonomy_call_delay_seconds": get_ai_taxonomy_call_delay_seconds(),
+                    "ai_taxonomy_max_calls_per_run": get_ai_taxonomy_max_calls_per_run(),
+                    "ai_taxonomy_calls_this_run": get_ai_taxonomy_calls_this_run(),
                     "career_ambiguity_ai_enabled": use_career_ai,
                     "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
                     "career_ai_call_delay_seconds": get_career_ai_call_delay_seconds(),

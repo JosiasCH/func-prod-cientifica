@@ -138,6 +138,43 @@ def get_career_ai_throttle_after_429_seconds() -> float:
     return min(120.0, parse_nonnegative_float(raw, default=8.0))
 
 
+def resolve_thematic_review_ai_enabled(request_value: str | None = None) -> bool:
+    """
+    IA selectiva para revisar/corregir SOLO clasificaciones temáticas sospechosas
+    de área/línea de carrera e IDIC. No reemplaza al clasificador completo.
+    """
+    if request_value is not None and str(request_value).strip() != "":
+        return parse_bool(request_value, default=False)
+    return get_bool_setting("THEMATIC_REVIEW_AI_ENABLED", default=False)
+
+
+def get_thematic_review_ai_min_confidence() -> float:
+    raw = os.environ.get("THEMATIC_REVIEW_AI_MIN_CONFIDENCE", "0.82")
+    try:
+        value = float(raw)
+    except Exception:
+        value = 0.82
+    return max(0.0, min(1.0, value))
+
+
+def get_thematic_review_ai_call_delay_seconds() -> float:
+    raw = os.environ.get("THEMATIC_REVIEW_AI_CALL_DELAY_SECONDS", "8.0")
+    return min(60.0, parse_nonnegative_float(raw, default=8.0))
+
+
+def get_thematic_review_ai_max_calls_per_run() -> int | None:
+    return parse_optional_positive_int_setting("THEMATIC_REVIEW_AI_MAX_CALLS_PER_RUN")
+
+
+def should_send_thematic_review_to_rejected() -> bool:
+    """
+    Si true, una decisión IA REVIEW en clasificación temática manda el caso a REVIEW
+    y no entra a curated. Default false para no reducir cobertura sin validar.
+    """
+    return get_bool_setting("THEMATIC_REVIEW_SEND_UNSAFE_TO_REVIEW", default=False)
+
+
+
 def get_ingest_singleton_lock_enabled() -> bool:
     """Evita ejecuciones simultáneas del ingest con un lock distribuido en SQL."""
     return get_bool_setting("SCOPUS_INGEST_SINGLETON_LOCK_ENABLED", default=True)
@@ -245,15 +282,41 @@ def release_scopus_ingest_singleton_lock(lock_conn) -> None:
 
 _LAST_AZURE_OPENAI_CALL_AT = 0.0
 _CAREER_AI_CALLS_THIS_RUN = 0
+_THEMATIC_REVIEW_AI_CALLS_THIS_RUN = 0
 
 
 def reset_ai_runtime_counters() -> None:
-    global _CAREER_AI_CALLS_THIS_RUN
+    global _CAREER_AI_CALLS_THIS_RUN, _THEMATIC_REVIEW_AI_CALLS_THIS_RUN
     _CAREER_AI_CALLS_THIS_RUN = 0
+    _THEMATIC_REVIEW_AI_CALLS_THIS_RUN = 0
 
 
 def get_career_ai_calls_this_run() -> int:
     return int(_CAREER_AI_CALLS_THIS_RUN)
+
+
+def get_thematic_review_ai_calls_this_run() -> int:
+    return int(_THEMATIC_REVIEW_AI_CALLS_THIS_RUN)
+
+
+def reserve_thematic_review_ai_call_slot() -> dict:
+    global _THEMATIC_REVIEW_AI_CALLS_THIS_RUN
+
+    max_calls = get_thematic_review_ai_max_calls_per_run()
+    if max_calls is not None and _THEMATIC_REVIEW_AI_CALLS_THIS_RUN >= max_calls:
+        return {
+            "allowed": False,
+            "calls_used": _THEMATIC_REVIEW_AI_CALLS_THIS_RUN,
+            "max_calls": max_calls,
+        }
+
+    _THEMATIC_REVIEW_AI_CALLS_THIS_RUN += 1
+    return {
+        "allowed": True,
+        "calls_used": _THEMATIC_REVIEW_AI_CALLS_THIS_RUN,
+        "max_calls": max_calls,
+    }
+
 
 
 def reserve_career_ai_call_slot() -> dict:
@@ -523,22 +586,33 @@ def clean_author_full_name(value: str) -> str:
 
 def is_ulima_text(value: str | None) -> bool:
     """
-    Detecta Universidad de Lima real y evita falsos positivos como
-    "University of Lima Sur" o instituciones que solo contienen la palabra Lima.
+    Detecta afiliación REAL a Universidad de Lima / University of Lima / ULIMA.
 
-    Esta función se usa en análisis por segmento de afiliación, por lo que debe ser
-    estricta: aceptar ULima real, pero no universidades externas con nombres parecidos.
+    Parche run80:
+    - Evita falsos positivos por instituciones externas que contienen "University of Lima"
+      como parte de otro nombre institucional.
+    - Normaliza puntuación para capturar casos como:
+      "National Technological University of Lima, Sur Lima".
+    - No acepta "Lima" como ciudad; solo la universidad exacta.
     """
     norm = normalize_generic_text(value)
     if not norm:
         return False
 
+    # Versión sin puntuación para que "Lima, Sur" y "Lima Sur" sean equivalentes.
+    norm_flat = re.sub(r"[^a-z0-9]+", " ", norm).strip()
+    norm_flat = re.sub(r"\s+", " ", norm_flat)
+
     negative_patterns = [
         "universidad de lima sur",
         "university of lima sur",
+        "technological university of lima",
         "technological university of lima sur",
+        "national technological university of lima",
         "national technological university of lima sur",
+        "universidad tecnologica de lima",
         "universidad tecnologica de lima sur",
+        "universidad nacional tecnologica de lima",
         "universidad nacional tecnologica de lima sur",
         "universidad nacional de ingenieria",
         "national university of engineering",
@@ -546,19 +620,25 @@ def is_ulima_text(value: str | None) -> bool:
         "technological university of peru",
         "universidad tecnologica de los andes",
         "universidad nacional mayor de san marcos",
+        "national university of san marcos",
+        "universidad nacional de san agustin",
+        "national university of san agustin",
     ]
 
-    if any(pattern in norm for pattern in negative_patterns):
+    if any(pattern in norm_flat for pattern in negative_patterns):
         return False
 
-    positive_patterns = [
-        "universidad de lima",
-        "university of lima",
-        "ulima",
+    # ULIMA explícito como token independiente.
+    if re.search(r"\bulima\b", norm_flat):
+        return True
+
+    # Aceptar solo la forma exacta "Universidad de Lima" / "University of Lima".
+    positive_regexes = [
+        r"(?<!national technological )(?<!technological )\buniversity of lima\b",
+        r"(?<!universidad nacional tecnologica )(?<!universidad tecnologica )\buniversidad de lima\b",
     ]
 
-    return any(pattern in norm for pattern in positive_patterns)
-
+    return any(re.search(pattern, norm_flat) for pattern in positive_regexes)
 
 def row_attr(row, attr: str, idx: int):
     try:
@@ -1814,6 +1894,99 @@ def choose_primary_career_for_classification(carrera_raw: str | None, text_field
     return ranked[0] if ranked else careers[0]
 
 
+
+
+def career_has_strong_thematic_evidence_for_docente_ref(career: str, text_fields: dict[str, str]) -> bool:
+    """
+    Evidencia mínima para rescatar casos ULima + DOCENTES_REF_ONLY cuando la
+    afiliación local no declara Facultad/Carrera de Ingeniería.
+
+    Esta regla NO reemplaza la afiliación explícita. Solo evita falsos negativos
+    cuando un docente de Industrial/Civil/Sistemas aparece en ref.docentes_ulima
+    y el título/abstract/keywords respaldan claramente su carrera.
+    """
+    if career == "Ingeniería Industrial":
+        return has_strong_industrial_evidence(text_fields)
+    if career == "Ingeniería Civil":
+        return has_strong_civil_evidence(text_fields)
+    if career == "Ingeniería de Sistemas":
+        return has_strong_systems_evidence(text_fields)
+    return False
+
+
+def resolve_docentes_ref_strong_thematic_rescue(
+    docente_ref_careers: list[str] | None,
+    text_fields: dict[str, str],
+) -> dict:
+    """
+    Decide si un registro rechazado por ausencia de contexto explícito de
+    ingeniería puede recuperarse por DOCENTES_REF + evidencia temática fuerte.
+
+    Resultado conservador:
+    - ACCEPT si hay una carrera docente con evidencia fuerte y dominante.
+    - REVIEW si hay empate/multicarrera ambigua o evidencia insuficiente.
+    """
+    careers = filter_valid_engineering_careers(docente_ref_careers or [])
+    if not careers:
+        return {
+            "accepted": False,
+            "careers": [],
+            "reason": "NO_DOCENTE_REF_TARGET_CAREER",
+            "score_map": {career: 0 for career in VALID_ENGINEERING_CAREERS},
+        }
+
+    score_map = score_career_inference_from_text_fields(text_fields)
+    strong_careers = [
+        career for career in careers
+        if career_has_strong_thematic_evidence_for_docente_ref(career, text_fields)
+    ]
+
+    if not strong_careers:
+        return {
+            "accepted": False,
+            "careers": [],
+            "reason": "DOCENTES_REF_WITHOUT_STRONG_THEMATIC_EVIDENCE",
+            "score_map": score_map,
+        }
+
+    if len(strong_careers) == 1:
+        return {
+            "accepted": True,
+            "careers": strong_careers,
+            "reason": "DOCENTES_REF_STRONG_THEMATIC_SINGLE_CAREER",
+            "score_map": score_map,
+        }
+
+    ranked = sorted(strong_careers, key=lambda c: (-score_map.get(c, 0), strong_careers.index(c)))
+    best = ranked[0]
+    best_score = score_map.get(best, 0)
+    second_score = score_map.get(ranked[1], 0) if len(ranked) > 1 else 0
+
+    # Si hay varias carreras docentes, solo aceptar la dominante; si no, REVIEW.
+    if (best_score - second_score) >= max(6, CAREER_INFERENCE_MIN_MARGIN):
+        return {
+            "accepted": True,
+            "careers": [best],
+            "reason": "DOCENTES_REF_STRONG_THEMATIC_DOMINANT_CAREER",
+            "score_map": score_map,
+        }
+
+    return {
+        "accepted": False,
+        "careers": strong_careers,
+        "reason": "DOCENTES_REF_STRONG_THEMATIC_AMBIGUOUS_MULTI_CAREER",
+        "score_map": score_map,
+    }
+
+
+def normalize_docentes_ref_careers_from_enrichment(enrichment: dict) -> list[str]:
+    raw = enrichment.get("docentes_ref_careers")
+    if isinstance(raw, list):
+        return filter_valid_engineering_careers(raw)
+    if isinstance(raw, str):
+        return filter_valid_engineering_careers(split_semicolon_values(raw))
+    return []
+
 def determine_row_engineering_eligibility(
     document_type_value: str | None,
     authors_with_affiliations_value: str | None,
@@ -1974,6 +2147,54 @@ def determine_row_engineering_eligibility(
                 "REVIEW_ULIMA_ENGINEERING_GENERIC_NO_TARGET_CAREER: "
                 "ULima engineering context detected, but no explicit target career and thematic inference was not strong enough. "
                 f"inference_reason={reason_detail}; scores={score_detail}"
+            ),
+        }
+
+    # Rescate conservador para falsos negativos:
+    # ULima real + docente en ref.docentes_ulima + evidencia temática fuerte,
+    # aunque la afiliación local no declare Facultad/Carrera de Ingeniería.
+    # Esto corrige casos como Lean/Industrial, ML/Sistemas y sísmica/Civil
+    # cuando Scopus solo reporta "Universidad de Lima" o "Instituto de Investigación Científica".
+    docente_ref_careers = normalize_docentes_ref_careers_from_enrichment(enrichment)
+    if (has_ulima_affiliation or enrichment.get("es_ulima_raw_detected")) and docente_ref_careers:
+        text_fields_for_docente_rescue = build_thematic_text_fields(
+            title_value,
+            abstract_value,
+            author_keywords_value,
+            index_keywords_value,
+            source_title_value,
+        )
+        rescue = resolve_docentes_ref_strong_thematic_rescue(
+            docente_ref_careers=docente_ref_careers,
+            text_fields=text_fields_for_docente_rescue,
+        )
+        rescue_score_map = rescue.get("score_map") or {}
+
+        if rescue.get("accepted") and rescue.get("careers"):
+            method_suffix_map = {
+                "Ingeniería Industrial": "INDUSTRIAL",
+                "Ingeniería Civil": "CIVIL",
+                "Ingeniería de Sistemas": "SISTEMAS",
+            }
+            rescued_careers = filter_valid_engineering_careers(rescue.get("careers"))
+            inferred_method_suffix = "_".join(method_suffix_map.get(career, "UNKNOWN") for career in rescued_careers)
+            return {
+                "eligible": True,
+                "carrera_raw": "; ".join(rescued_careers),
+                "reason": None,
+                "metodo_cruce_scopus_raw": f"DOCENTES_REF_STRONG_THEMATIC_EVIDENCE_{inferred_method_suffix}",
+            }
+
+        return {
+            "eligible": False,
+            "carrera_raw": None,
+            "reason": (
+                "REVIEW_ULIMA_DOCENTES_REF_NO_ENGINEERING_CONTEXT: "
+                "ULima affiliation and docente_ref detected, but explicit engineering affiliation is missing "
+                "and thematic evidence was not safe enough for automatic acceptance. "
+                f"rescue_reason={rescue.get('reason')}; "
+                f"docente_ref_careers={'; '.join(docente_ref_careers)}; "
+                f"scores={serialize_score_map_for_reason(rescue_score_map)}"
             ),
         }
 
@@ -3735,6 +3956,13 @@ def apply_final_career_guardrails(
                 return "Aplicaciones en inteligencia artificial", "Visión computacional", "career_guardrail_systems_vision_over_security"
 
     if carrera == "Ingeniería Industrial":
+        # Priorizar SCM cuando la evidencia central es inventario, almacén, logística, EOQ/MRP, slotting, fill rate o supply chain.
+        # Esto evita que papers logísticos caigan por defecto en Operations Engineering & Management.
+        if contains_any_phrase_in_text_fields(text_fields, INDUSTRIAL_SCM_STRONG_SIGNALS):
+            if contains_any_phrase_in_text_fields(text_fields, ["supply chain", "cadena de suministro"]):
+                return "Supply Chain Management", "Gestión de la cadena de suministro", "career_guardrail_industrial_supply_chain_over_operations"
+            return "Supply Chain Management", "Gestión de Inventarios, Almacenes y Transportes", "career_guardrail_industrial_inventory_warehouse_over_operations"
+
         if area_carrera == "Operations Research & Analysis" and contains_any_phrase_in_text_fields(text_fields, CHEM_MATERIAL_PRODUCT_STRONG_SIGNALS):
             return "Product Design & Development", "Desarrollo de producto", "career_guardrail_industrial_product_over_ora"
 
@@ -4043,6 +4271,20 @@ def apply_final_idic_guardrails(
         text_fields,
         IDIC_ORG_TRANSFORMATION_STRONG_SIGNALS,
     )
+
+    if (
+        category_tematica == "Gestión y economía del conocimiento"
+        and area_idic == "Innovación empresarial"
+        and linea_idic in ("Gestión de la innovación", "Transformación organizacional")
+        and contains_any_phrase_in_text_fields(text_fields, IDIC_ADVANCED_MATERIALS_STRONG_SIGNALS)
+        and not innovation_present
+    ):
+        return (
+            "Desarrollo sostenible y medioambiente",
+            "Tecnología y ecosistemas",
+            "Materiales avanzados",
+            "idic_guardrail_materials_over_generic_innovation",
+        )
 
     if (
         category_tematica == "Gestión y economía del conocimiento"
@@ -4838,6 +5080,356 @@ def classify_idic_with_llm(
         return empty_result
 
 
+
+# =========================
+# THEMATIC REVIEW AI + DETERMINISTIC OVERRIDES (run80)
+# =========================
+KNOWLEDGE_MANAGEMENT_SIGNALS = [
+    "knowledge management", "gestion del conocimiento", "gestión del conocimiento",
+    "absorptive capacity", "absorptive capacities", "capacidad de absorcion", "capacidad de absorción",
+    "knowledge acquisition", "knowledge sharing", "knowledge creation", "knowledge exchange",
+    "unlearning", "organizational learning", "aprendizaje organizacional",
+    "organizational performance", "innovation performance", "value chain", "value chains",
+    "microenterprises", "quality management", "telecommuting", "shadow information technology", "shadow it",
+]
+
+COMPUTING_EDUCATION_SIGNALS = [
+    "computer science education", "computing education", "information systems education",
+    "engineering education", "programming education", "introduction to programming",
+    "computational thinking", "yupana", "mooc", "moocs", "online education",
+    "higher education", "curricular design", "research competencies", "undergraduate students",
+]
+
+IT_GOVERNANCE_SIGNALS = [
+    "it governance", "cobit", "iso 38500", "information systems", "shadow it",
+    "information technology adoption", "benefit dependency network", "information technology",
+]
+
+BLOCKCHAIN_SIGNALS = [
+    "blockchain", "smart contract", "smart contracts", "ethereum", "proof of work", "traceability",
+]
+
+SYSTEMS_ALGORITHM_SIGNALS = [
+    "compiler", "source to source", "automatic parallelization", "parallelization", "mutation testing",
+    "genetic algorithm", "functional programming", "algorithm", "algorithms", "dynamic programming",
+    "pattern recognition", "route planning", "vehicle routing", "ant colony", "k-means", "k means",
+]
+
+EDUCATION_IDIC_SIGNALS = COMPUTING_EDUCATION_SIGNALS + [
+    "education", "educational", "learning", "teaching", "students", "teachers", "school", "curriculum",
+]
+
+ENVIRONMENTAL_WATER_AIR_SIGNALS = [
+    "air pollution", "air pollutants", "indoor air quality", "water quality", "water treatment",
+    "wastewater", "groundwater", "aquifer", "pathogen migration", "subsurface", "sediments",
+    "suspended sediments", "marine pollution", "phosphogypsum", "naproxen", "paracetamol",
+    "activated carbon", "adsorption", "contaminant", "contaminants", "pollutant", "pollutants",
+    "nanoparticles", "hazardous elements", "particulate matter", "pm1", "pm2.5", "pm10",
+]
+
+COMMERCIAL_PROCESS_INDUSTRIAL_RESCUE_SIGNALS = [
+    "commercial model", "sales cycle", "lead handling", "crm", "bpm", "scrum", "sales",
+    "retail", "automotive retailer", "business management model", "lean methodologies",
+    "kanban", "tpm", "5s", "delivery time", "textile factory", "factory", "process improvement",
+    "productivity", "operations", "operational", "poka yoke", "forecasting",
+]
+
+
+def classify_systems_specific_line_from_domain(text_fields: dict[str, str]) -> tuple[str | None, str | None, str | None]:
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS):
+        return "Aplicaciones en inteligencia artificial", "Visión computacional", "run80_systems_computer_vision"
+    if contains_any_phrase_in_text_fields(text_fields, ["nlp", "natural language processing", "large language model", "llm"]):
+        return "Aplicaciones en inteligencia artificial", "NLP", "run80_systems_nlp"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ML_STRONG_SIGNALS):
+        return "Aplicaciones en inteligencia artificial", "Aprendizaje automático", "run80_systems_ml"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_CYBER_STRONG_SIGNALS + BLOCKCHAIN_SIGNALS):
+        return "Sistemas de Tecnologías de Información (TI)", "Redes y ciberseguridad", "run80_systems_security_blockchain"
+    if contains_any_phrase_in_text_fields(text_fields, ["iot", "internet of things", "wireless sensor network", "sensor network"]):
+        return "Sistemas de Tecnologías de Información (TI)", "IoT", "run80_systems_iot"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ARVR_STRONG_SIGNALS):
+        return "Interacción humano-computadora", "Realidad virtual y aumentada", "run80_systems_arvr"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_GAME_STRONG_SIGNALS):
+        return "Interacción humano-computadora", "Construcción de juegos y gamificación", "run80_systems_gamification"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_AGENT_STRONG_SIGNALS):
+        return "Interacción humano-computadora", "Agentes virtuales", "run80_systems_virtual_agents"
+    if contains_any_phrase_in_text_fields(text_fields, KNOWLEDGE_MANAGEMENT_SIGNALS):
+        return "Tecnologías y gestión de la información", "Sistemas de gestión del conocimiento", "run80_systems_knowledge_management"
+    if contains_any_phrase_in_text_fields(text_fields, IT_GOVERNANCE_SIGNALS):
+        return "Tecnologías y gestión de la información", "Gestión de procesos tecnológicos", "run80_systems_it_governance"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ALGORITHM_SIGNALS):
+        return "Algoritmos y sistemas computacionales", "Diseño de algoritmos", "run80_systems_algorithms"
+    if contains_any_phrase_in_text_fields(text_fields, COMPUTING_EDUCATION_SIGNALS):
+        return "Tecnologías y gestión de la información", "Computación aplicada", "run80_systems_computing_education"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_SOFTWARE_STRONG_SIGNALS):
+        return "Algoritmos y sistemas computacionales", "Ingeniería de software", "run80_systems_software"
+    return None, None, None
+
+
+def classify_idic_specific_line_from_domain(text_fields: dict[str, str]) -> tuple[str | None, str | None, str | None, str | None]:
+    if contains_any_phrase_in_text_fields(text_fields, ENVIRONMENTAL_WATER_AIR_SIGNALS):
+        if contains_any_phrase_in_text_fields(text_fields, IDIC_ADVANCED_MATERIALS_STRONG_SIGNALS):
+            return "Desarrollo sostenible y medioambiente", "Tecnología y ecosistemas", "Materiales avanzados", "run80_idic_environment_materials"
+        return "Desarrollo sostenible y medioambiente", "Tecnología y ecosistemas", "Gestión de residuos", "run80_idic_environment_waste"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS):
+        return "Innovación y tecnología digital", "Inteligencia artificial y computación avanzada", "Visión computacional", "run80_idic_computer_vision"
+    if contains_any_phrase_in_text_fields(text_fields, IDIC_MACHINE_LEARNING_STRONG_SIGNALS + SYSTEMS_ML_STRONG_SIGNALS):
+        return "Innovación y tecnología digital", "Inteligencia artificial y computación avanzada", "Machine learning y deep learning", "run80_idic_ml"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_CYBER_STRONG_SIGNALS + BLOCKCHAIN_SIGNALS):
+        return "Innovación y tecnología digital", "Transformación digital", "Ciberseguridad y privacidad", "run80_idic_cyber_blockchain"
+    if contains_any_phrase_in_text_fields(text_fields, ["iot", "internet of things", "wireless sensor network", "sensor network"]):
+        return "Innovación y tecnología digital", "Transformación digital", "Internet de las cosas (IoT)", "run80_idic_iot"
+    if contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ARVR_STRONG_SIGNALS):
+        return "Innovación y tecnología digital", "Experiencia digital humana", "Realidad virtual y aumentada", "run80_idic_arvr"
+    if contains_any_phrase_in_text_fields(text_fields, EDUCATION_IDIC_SIGNALS):
+        return "Sociedad y comportamiento humano", "Bienestar y desarrollo humano", "Educación, desarrollo cognitivo y socioafectivo", "run80_idic_education"
+    if contains_any_phrase_in_text_fields(text_fields, KNOWLEDGE_MANAGEMENT_SIGNALS):
+        return "Gestión y economía del conocimiento", "Gestión del conocimiento", "Aprendizaje organizacional", "run80_idic_knowledge_management"
+    if contains_any_phrase_in_text_fields(text_fields, COMMERCIAL_PROCESS_INDUSTRIAL_RESCUE_SIGNALS + IDIC_INNOVATION_MANAGEMENT_STRONG_SIGNALS):
+        return "Gestión y economía del conocimiento", "Innovación empresarial", "Gestión de la innovación", "run80_idic_innovation_management"
+    return None, None, None, None
+
+
+def apply_run80_domain_specific_overrides(carrera: str | None, merged: dict, text_fields: dict[str, str]) -> tuple[dict, list[str]]:
+    result = dict(merged)
+    sources: list[str] = []
+
+    if carrera == "Ingeniería de Sistemas":
+        sensitive = result.get("linea_carrera_raw") in {
+            "Realidad virtual y aumentada", "Visión computacional", "Ingeniería de software", "Agentes virtuales",
+        }
+        if sensitive:
+            area, line, source = classify_systems_specific_line_from_domain(text_fields)
+            if area and line and is_valid_career_area_line(carrera, area, line):
+                if area != result.get("area_carrera_raw") or line != result.get("linea_carrera_raw"):
+                    result["area_carrera_raw"] = area
+                    result["linea_carrera_raw"] = line
+                    sources.append(source or "run80_systems_sensitive_override")
+
+        if contains_any_phrase_in_text_fields(text_fields, KNOWLEDGE_MANAGEMENT_SIGNALS):
+            area, line = "Tecnologías y gestión de la información", "Sistemas de gestión del conocimiento"
+            if is_valid_career_area_line(carrera, area, line):
+                result["area_carrera_raw"] = area
+                result["linea_carrera_raw"] = line
+                sources.append("run80_systems_knowledge_management_override")
+
+    if carrera == "Ingeniería Civil":
+        if result.get("linea_carrera_raw") == "Calidad del Agua" or contains_any_phrase_in_text_fields(text_fields, ENVIRONMENTAL_WATER_AIR_SIGNALS):
+            cat, area, line, source = classify_idic_specific_line_from_domain(text_fields)
+            if cat and area and line and is_valid_idic_triplet(cat, area, line):
+                result["category_tematica_raw"] = cat
+                result["area_idic_raw"] = area
+                result["linea_idic_raw"] = line
+                sources.append(source or "run80_civil_environment_idic_override")
+
+    if carrera == "Ingeniería Industrial":
+        if contains_any_phrase_in_text_fields(text_fields, COMMERCIAL_PROCESS_INDUSTRIAL_RESCUE_SIGNALS):
+            area, line = "Operations Engineering & Management", "Planeamiento y Gestión de Operaciones"
+            if contains_any_phrase_in_text_fields(text_fields, ["inventory", "warehouse", "supply chain", "logistics"]):
+                area, line = "Supply Chain Management", "Gestión de Inventarios, Almacenes y Transportes"
+            if is_valid_career_area_line(carrera, area, line):
+                result["area_carrera_raw"] = area
+                result["linea_carrera_raw"] = line
+                sources.append("run80_industrial_process_override")
+
+    current_idic_line = result.get("linea_idic_raw")
+    idic_is_sensitive_wrong = (
+        (current_idic_line == "Realidad virtual y aumentada" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ARVR_STRONG_SIGNALS))
+        or (current_idic_line == "Visión computacional" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS))
+        or (current_idic_line == "Tecnologías emergentes" and not contains_any_phrase_in_text_fields(text_fields, IDIC_EMERGING_TECH_STRONG_SIGNALS))
+    )
+    if idic_is_sensitive_wrong:
+        cat, area, line, source = classify_idic_specific_line_from_domain(text_fields)
+        if cat and area and line and is_valid_idic_triplet(cat, area, line):
+            result["category_tematica_raw"] = cat
+            result["area_idic_raw"] = area
+            result["linea_idic_raw"] = line
+            sources.append(source or "run80_idic_sensitive_override")
+
+    return result, unique_keep_order([s for s in sources if s])
+
+
+def detect_thematic_review_reasons(carrera: str | None, merged: dict, text_fields: dict[str, str]) -> list[str]:
+    reasons: list[str] = []
+
+    if carrera == "Ingeniería de Sistemas":
+        if merged.get("linea_carrera_raw") == "Visión computacional" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS):
+            reasons.append("SYSTEMS_COMPUTER_VISION_WITHOUT_EVIDENCE")
+        if merged.get("linea_carrera_raw") == "Realidad virtual y aumentada" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ARVR_STRONG_SIGNALS):
+            reasons.append("SYSTEMS_ARVR_WITHOUT_EVIDENCE")
+        if merged.get("linea_carrera_raw") == "Ingeniería de software" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_SOFTWARE_STRONG_SIGNALS + SYSTEMS_ALGORITHM_SIGNALS):
+            reasons.append("SYSTEMS_SOFTWARE_WITHOUT_EVIDENCE")
+        if contains_any_phrase_in_text_fields(text_fields, KNOWLEDGE_MANAGEMENT_SIGNALS) and merged.get("linea_carrera_raw") in {"Visión computacional", "Realidad virtual y aumentada", "Ingeniería de software"}:
+            reasons.append("KNOWLEDGE_MANAGEMENT_MISROUTED_TO_SYSTEMS_SENSITIVE_LINE")
+
+    if carrera == "Ingeniería Civil":
+        if merged.get("linea_carrera_raw") == "Calidad del Agua" and merged.get("linea_idic_raw") in {"Realidad virtual y aumentada", "Visión computacional", "Tecnologías emergentes"}:
+            reasons.append("CIVIL_ENVIRONMENT_WITH_DIGITAL_IDIC_MISMATCH")
+
+    if merged.get("linea_idic_raw") == "Realidad virtual y aumentada" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_ARVR_STRONG_SIGNALS):
+        reasons.append("IDIC_ARVR_WITHOUT_EVIDENCE")
+    if merged.get("linea_idic_raw") == "Visión computacional" and not contains_any_phrase_in_text_fields(text_fields, SYSTEMS_COMPUTER_VISION_STRONG_SIGNALS):
+        reasons.append("IDIC_COMPUTER_VISION_WITHOUT_EVIDENCE")
+
+    return unique_keep_order(reasons)
+
+
+def build_thematic_review_ai_prompt(
+    carrera: str,
+    current_result: dict,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+    review_reasons: list[str],
+) -> str:
+    payload = {
+        "task": "review_and_correct_thematic_classification_for_ulima_engineering_publication",
+        "allowed_decisions": ["KEEP", "CORRECT", "REVIEW"],
+        "career": carrera,
+        "career_catalog_for_this_career": CAREER_AREA_LINE_CATALOG.get(carrera, {}),
+        "idic_catalog": IDIC_CATEGORY_AREA_LINE_CATALOG,
+        "current_classification": {
+            "area_carrera_raw": current_result.get("area_carrera_raw"),
+            "linea_carrera_raw": current_result.get("linea_carrera_raw"),
+            "category_tematica_raw": current_result.get("category_tematica_raw"),
+            "area_idic_raw": current_result.get("area_idic_raw"),
+            "linea_idic_raw": current_result.get("linea_idic_raw"),
+        },
+        "review_reasons": review_reasons,
+        "article": {
+            "title": clip_text(title_value, 2200),
+            "abstract_scopus": clip_text(abstract_value, 9000),
+            "author_keywords": clip_text(author_keywords_value, 2500),
+            "index_keywords": clip_text(index_keywords_value, 2500),
+            "source_title": clip_text(source_title_value, 1200),
+        },
+        "output_schema": {
+            "decision": "KEEP|CORRECT|REVIEW",
+            "area_carrera_raw": "string|null",
+            "linea_carrera_raw": "string|null",
+            "category_tematica_raw": "string|null",
+            "area_idic_raw": "string|null",
+            "linea_idic_raw": "string|null",
+            "confidence": "number 0..1",
+            "rationale": "short Spanish explanation, max 45 words",
+        },
+        "rules": [
+            "Corrige SOLO si el catálogo permite una alternativa claramente mejor.",
+            "No cambies la carrera; solo revisa área/línea de carrera e IDIC.",
+            "Usa el abstract como evidencia principal; título y keywords como apoyo.",
+            "No uses Visión computacional sin evidencia de imágenes, video, detección, visión, YOLO, GAN, keypoints u homografía.",
+            "No uses Realidad virtual y aumentada sin evidencia explícita de AR/VR/mixed reality.",
+            "No uses Ingeniería de software solo por palabras genéricas como plataforma, online o educación.",
+            "Para knowledge management/absorptive capacity/organizational learning, evita CV/VR/software salvo evidencia técnica fuerte.",
+            "Para contaminación, agua, aire, sedimentos, adsorción o nanopartículas ambientales, favorece Desarrollo sostenible y medioambiente.",
+            "Si la mejor corrección no es clara, devuelve REVIEW.",
+            "Devuelve SOLO JSON válido, sin markdown.",
+        ],
+    }
+    return (
+        "Eres un auditor académico senior de clasificación temática de producción científica ULima. "
+        "Revisa clasificaciones sospechosas y corrige con criterio conservador.\\n\\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def review_thematic_classification_with_ai(
+    carrera: str,
+    current_result: dict,
+    title_value: str | None,
+    abstract_value: str | None,
+    author_keywords_value: str | None,
+    index_keywords_value: str | None,
+    source_title_value: str | None,
+    review_reasons: list[str],
+) -> dict:
+    empty = {"decision": "NO_AI_RESULT", "confidence": None, "raw": None, "rationale": None}
+
+    if not is_thematic_llm_configured():
+        empty["decision"] = "AI_NOT_CONFIGURED"
+        return empty
+
+    call_slot = reserve_thematic_review_ai_call_slot()
+    if not call_slot.get("allowed"):
+        empty["decision"] = f"AI_SKIPPED_MAX_CALLS_PER_RUN_{call_slot.get('calls_used')}_OF_{call_slot.get('max_calls')}"
+        return empty
+
+    prompt = build_thematic_review_ai_prompt(
+        carrera=carrera,
+        current_result=current_result,
+        title_value=title_value,
+        abstract_value=abstract_value,
+        author_keywords_value=author_keywords_value,
+        index_keywords_value=index_keywords_value,
+        source_title_value=source_title_value,
+        review_reasons=review_reasons,
+    )
+    raw = call_openai_responses_json(
+        prompt,
+        throttle_seconds=get_thematic_review_ai_call_delay_seconds(),
+        call_label="thematic_review_ai",
+    )
+    if not raw:
+        empty["decision"] = "AI_FAILED_OR_NON_JSON"
+        return empty
+
+    decision = str(raw.get("decision") or "").strip().upper()
+    confidence = parse_float_or_none(raw.get("confidence"))
+    result = {"decision": decision or "INVALID_DECISION", "confidence": confidence, "raw": raw, "rationale": raw.get("rationale")}
+
+    if decision not in {"KEEP", "CORRECT", "REVIEW"}:
+        result["decision"] = "INVALID_DECISION"
+        return result
+
+    return result
+
+
+def apply_thematic_review_ai_result(carrera: str, merged: dict, ai_result: dict) -> tuple[dict, str | None]:
+    if not ai_result or ai_result.get("decision") != "CORRECT":
+        return merged, None
+
+    confidence = ai_result.get("confidence")
+    if confidence is None or float(confidence) < get_thematic_review_ai_min_confidence():
+        return merged, None
+
+    raw = ai_result.get("raw") or {}
+    area_carrera = coerce_choice(raw.get("area_carrera_raw"), get_allowed_career_areas(carrera))
+    linea_carrera = coerce_choice(raw.get("linea_carrera_raw"), get_allowed_career_lines(carrera))
+    if linea_carrera and not area_carrera:
+        area_carrera = coerce_area_carrera_from_linea(carrera, linea_carrera)
+
+    category_tematica = coerce_choice(raw.get("category_tematica_raw"), get_allowed_idic_categories())
+    area_idic = coerce_choice(raw.get("area_idic_raw"), get_allowed_idic_areas(category_tematica))
+    if not area_idic:
+        area_idic = coerce_choice(raw.get("area_idic_raw"), get_allowed_idic_areas())
+    linea_idic = coerce_choice(raw.get("linea_idic_raw"), get_allowed_idic_lines(category_tematica, area_idic))
+    if not linea_idic:
+        linea_idic = coerce_choice(raw.get("linea_idic_raw"), get_allowed_idic_lines())
+    if linea_idic and not area_idic:
+        area_idic = coerce_area_idic_from_linea(linea_idic)
+    if area_idic and not category_tematica:
+        category_tematica = coerce_category_tematica_from_area(area_idic)
+
+    corrected = dict(merged)
+    changed = False
+    if is_valid_career_area_line(carrera, area_carrera, linea_carrera):
+        corrected["area_carrera_raw"] = area_carrera
+        corrected["linea_carrera_raw"] = linea_carrera
+        changed = True
+    if is_valid_idic_triplet(category_tematica, area_idic, linea_idic):
+        corrected["category_tematica_raw"] = category_tematica
+        corrected["area_idic_raw"] = area_idic
+        corrected["linea_idic_raw"] = linea_idic
+        changed = True
+
+    if changed:
+        if ai_result.get("rationale"):
+            set_first_justification(corrected, str(ai_result.get("rationale")))
+        return corrected, "thematic_review_ai_corrected"
+
+    return merged, None
+
 def classify_thematic_fields(
     carrera: str | None,
     title_value: str | None,
@@ -4846,6 +5438,7 @@ def classify_thematic_fields(
     index_keywords_value: str | None,
     source_title_value: str | None,
     use_llm: bool | None = None,
+    use_thematic_review_ai: bool | None = None,
 ) -> dict:
     """
     Clasificación temática optimizada para carga masiva.
@@ -4864,6 +5457,8 @@ def classify_thematic_fields(
 
     if use_llm is None:
         use_llm = resolve_llm_enabled()
+    if use_thematic_review_ai is None:
+        use_thematic_review_ai = resolve_thematic_review_ai_enabled()
 
     career_fields = ["area_carrera_raw", "linea_carrera_raw"]
     idic_fields = ["category_tematica_raw", "area_idic_raw", "linea_idic_raw"]
@@ -5081,6 +5676,37 @@ def classify_thematic_fields(
         merged["linea_idic_raw"] = fallback_line
         append_classification_source(merged, fallback_source)
         set_first_justification(merged, "Fallback institucional obligatorio de IDIC para evitar NULLs.")
+
+    # Run80 deterministic overrides after all fallbacks.
+    merged, run80_sources = apply_run80_domain_specific_overrides(carrera, merged, text_fields)
+    for source in run80_sources:
+        append_classification_source(merged, source)
+
+    # Run80 selective AI review: only suspicious accepted classifications.
+    review_reasons = detect_thematic_review_reasons(carrera, merged, text_fields)
+    if use_thematic_review_ai and review_reasons:
+        ai_review = review_thematic_classification_with_ai(
+            carrera=carrera,
+            current_result=merged,
+            title_value=title_value,
+            abstract_value=abstract_value,
+            author_keywords_value=author_keywords_value,
+            index_keywords_value=index_keywords_value,
+            source_title_value=source_title_value,
+            review_reasons=review_reasons,
+        )
+        append_classification_source(merged, f"thematic_review_ai_{ai_review.get('decision', 'NO_RESULT')}")
+        corrected, ai_source = apply_thematic_review_ai_result(carrera, merged, ai_review)
+        merged = corrected
+        if ai_source:
+            append_classification_source(merged, ai_source)
+        if ai_review.get("decision") == "REVIEW" and should_send_thematic_review_to_rejected():
+            merged["thematic_review_rejected"] = True
+            merged["thematic_review_rejection_reason"] = (
+                "REVIEW_THEMATIC_CLASSIFICATION_UNSAFE: selective AI requested manual review. "
+                f"reasons={';'.join(review_reasons)}; confidence={ai_review.get('confidence')}; "
+                f"rationale={(ai_review.get('rationale') or '')[:500]}"
+            )
 
     return merged
 
@@ -5311,6 +5937,50 @@ def reactivate_curated_publications_from_valid_stg(run_id: int) -> int:
                     )
                )
             WHERE ISNULL(c.is_active, 0) = 0
+            """,
+            (run_id,),
+        )
+        affected = cursor.rowcount if cursor.rowcount is not None else 0
+        conn.commit()
+        cursor.close()
+
+    return int(affected) if affected and affected > 0 else 0
+
+
+def deactivate_curated_publications_from_rejected_stg(run_id: int) -> int:
+    """
+    Si un artículo fue aceptado en un run anterior pero en el run actual queda
+    rechazado/REVIEW, se desactiva en curated para que no siga apareciendo en
+    Power BI por arrastre histórico.
+    """
+    from mssql_python import connect
+
+    sql_conn_str = get_sql_connection_string()
+
+    with connect(sql_conn_str) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE c
+            SET
+                c.is_active = 0,
+                c.updated_at_utc = SYSUTCDATETIME()
+            FROM curated.publications c
+            INNER JOIN stg.scopus_raw_load s
+                ON s.run_id = ?
+               AND s.is_valid_for_curated = 0
+               AND (
+                    (s.eid IS NOT NULL AND c.eid = s.eid)
+                 OR (s.eid IS NULL AND s.doi_link_raw IS NOT NULL AND c.doi_link = s.doi_link_raw)
+                 OR (
+                        s.eid IS NULL
+                    AND s.doi_link_raw IS NULL
+                    AND s.publication_title_raw IS NOT NULL
+                    AND LOWER(LTRIM(RTRIM(c.publication_title))) = LOWER(LTRIM(RTRIM(s.publication_title_raw)))
+                    AND c.publication_year = TRY_CONVERT(INT, s.publication_year_raw)
+                    )
+               )
+            WHERE ISNULL(c.is_active, 0) = 1
             """,
             (run_id,),
         )
@@ -6059,6 +6729,7 @@ def enrich_ulima_fields_from_ref(
 
     ulima_authors_detected: list[str] = []
     publication_careers: list[str] = []
+    docente_ref_careers: list[str] = []
     first_author_ulima = False
     matched_any = False
     affiliation_ulima_detected = False
@@ -6109,6 +6780,9 @@ def enrich_ulima_fields_from_ref(
             matched_any = True
             docente = match_result["docente"]
 
+            if docente.get("carrera") in VALID_ENGINEERING_CAREERS:
+                docente_ref_careers.append(docente.get("carrera"))
+
             if (
                 not block_careers
                 and block_details.get("has_ulima_engineering_context")
@@ -6123,6 +6797,7 @@ def enrich_ulima_fields_from_ref(
         has_ulima_engineering_affiliation = True
 
     publication_careers = unique_keep_order([c for c in publication_careers if c])
+    docente_ref_careers = unique_keep_order([c for c in docente_ref_careers if c])
     ulima_authors_detected = unique_keep_order([a for a in ulima_authors_detected if a])
 
     if matched_any and publication_careers:
@@ -6138,6 +6813,7 @@ def enrich_ulima_fields_from_ref(
         "ulima_docentes_raw": "; ".join(ulima_authors_detected) if ulima_authors_detected else None,
         "first_author_ulima_raw": "True" if first_author_ulima else "False",
         "carrera_raw": "; ".join(publication_careers) if publication_careers else None,
+        "docentes_ref_careers": docente_ref_careers,
         "metodo_cruce_scopus_raw": metodo,
         "es_ulima_raw_detected": affiliation_ulima_detected,
         "has_ulima_engineering_affiliation_raw": has_ulima_engineering_affiliation,
@@ -6186,7 +6862,13 @@ COLUMN_ALIASES = {
 }
 
 
-def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None = None, use_career_ai: bool = False) -> dict:
+def map_row_to_staging(
+    row: dict,
+    docentes_ref: list[dict],
+    use_llm: bool | None = None,
+    use_career_ai: bool = False,
+    use_thematic_review_ai: bool = False,
+) -> dict:
     mapped = {}
 
     for target_column, aliases in COLUMN_ALIASES.items():
@@ -6325,6 +7007,7 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None
             index_keywords_value=mapped.get("index_keywords_raw"),
             source_title_value=mapped.get("source_title_raw"),
             use_llm=use_llm,
+            use_thematic_review_ai=use_thematic_review_ai,
         )
 
         if not mapped.get("area_carrera_raw") and thematic.get("area_carrera_raw"):
@@ -6339,8 +7022,22 @@ def map_row_to_staging(row: dict, docentes_ref: list[dict], use_llm: bool | None
         if not mapped.get("area_idic_raw") and thematic.get("area_idic_raw"):
             mapped["area_idic_raw"] = thematic["area_idic_raw"]
 
-        if not mapped.get("linea_idic_raw") and thematic.get("linea_idic_raw"):
-            mapped["linea_idic_raw"] = thematic["linea_idic_raw"]
+        if thematic.get("thematic_review_rejected"):
+            mapped["area_carrera_raw"] = thematic.get("area_carrera_raw")
+            mapped["linea_carrera_raw"] = thematic.get("linea_carrera_raw")
+            mapped["category_tematica_raw"] = thematic.get("category_tematica_raw")
+            mapped["area_idic_raw"] = thematic.get("area_idic_raw")
+            mapped["linea_idic_raw"] = thematic.get("linea_idic_raw")
+            mapped = sanitize_identifier_fields(mapped)
+            mapped["record_hash"] = compute_record_hash(
+                mapped.get("eid"),
+                mapped.get("doi_link_raw"),
+                mapped.get("publication_title_raw"),
+            )
+            mapped["is_valid_for_curated"] = 0
+            mapped["rejection_reason"] = thematic.get("thematic_review_rejection_reason")
+            mapped["__skip_insert__"] = True
+            return mapped
 
     if not is_valid_career_area_line(
         carrera_for_classification,
@@ -6527,6 +7224,7 @@ def insert_rows_to_staging(
     source_row_start: int = 1,
     use_llm: bool | None = None,
     use_career_ai: bool = False,
+    use_thematic_review_ai: bool = False,
 ) -> tuple[int, int, list[tuple[int, dict]]]:
     """
     Inserta SOLO filas válidas en staging antes del upsert y devuelve rechazados en memoria.
@@ -6546,7 +7244,13 @@ def insert_rows_to_staging(
         cursor = conn.cursor()
 
         for idx, row in enumerate(rows, start=source_row_start):
-            mapped = map_row_to_staging(row, docentes_ref=docentes_ref, use_llm=use_llm, use_career_ai=use_career_ai)
+            mapped = map_row_to_staging(
+                row,
+                docentes_ref=docentes_ref,
+                use_llm=use_llm,
+                use_career_ai=use_career_ai,
+                use_thematic_review_ai=use_thematic_review_ai,
+            )
 
             if mapped.get("is_valid_for_curated") == 1 and not mapped.get("__skip_insert__"):
                 insert_scopus_raw_load_row(cursor, run_id, source_file_name, idx, mapped)
@@ -6614,6 +7318,12 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "containers": container_status,
             "thematic_llm_configured": is_thematic_llm_configured(),
             "thematic_llm_enabled": resolve_llm_enabled(),
+            "thematic_review_ai_configured": is_thematic_llm_configured(),
+            "thematic_review_ai_enabled": resolve_thematic_review_ai_enabled(),
+            "thematic_review_ai_min_confidence": get_thematic_review_ai_min_confidence(),
+            "thematic_review_ai_call_delay_seconds": get_thematic_review_ai_call_delay_seconds(),
+            "thematic_review_ai_max_calls_per_run": get_thematic_review_ai_max_calls_per_run(),
+            "thematic_review_send_unsafe_to_review": should_send_thematic_review_to_rejected(),
             "career_ambiguity_ai_configured": is_thematic_llm_configured(),
             "career_ambiguity_ai_enabled": resolve_career_ambiguity_ai_enabled(),
             "career_ambiguity_ai_min_confidence": get_career_ambiguity_llm_min_confidence(),
@@ -6629,8 +7339,9 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "engineering_generic_inference_enabled": True,
             "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
             "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
-            "classification_guardrails_version": "v6_run73_singleton_lock_and_stronger_throttle_patch",
+            "classification_guardrails_version": "v8_run83_docentes_ref_strong_thematic_rescue_patch",
             "post_upsert_reactivation_enabled": True,
+            "post_upsert_deactivation_from_rejected_enabled": True,
         }
 
         return func.HttpResponse(
@@ -6817,6 +7528,11 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             request_payload,
             ["career_ai", "careerAi", "career_ambiguity_ai", "career_llm", "ai_career", "use_career_ai", "useCareerAi"],
         )
+        thematic_review_ai_value = get_request_value(
+            req,
+            request_payload,
+            ["theme_review_ai", "thematic_review_ai", "thematicReviewAi", "review_ai", "use_thematic_review_ai"],
+        )
         save_rejected_value = get_request_value(
             req,
             request_payload,
@@ -6825,6 +7541,7 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
 
         use_llm = resolve_llm_enabled(llm_value)
         use_career_ai = resolve_career_ambiguity_ai_enabled(career_ai_value)
+        use_thematic_review_ai = resolve_thematic_review_ai_enabled(thematic_review_ai_value)
         save_rejected_to_staging = resolve_save_rejected_enabled(save_rejected_value)
 
         reset_ai_runtime_counters()
@@ -6860,18 +7577,21 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             source_row_start=effective_start_row,
             use_llm=use_llm,
             use_career_ai=use_career_ai,
+            use_thematic_review_ai=use_thematic_review_ai,
         )
 
         execute_upsert_from_staging(run_id)
         records_reactivated_in_curated = reactivate_curated_publications_from_valid_stg(run_id)
 
         records_rejected_saved_to_staging = 0
+        records_deactivated_from_rejected = 0
         if save_rejected_to_staging:
             records_rejected_saved_to_staging = insert_rejected_rows_to_staging(
                 run_id=run_id,
                 source_file_name=blob_name,
                 rejected_audit_rows=rejected_audit_rows,
             )
+            records_deactivated_from_rejected = deactivate_curated_publications_from_rejected_stg(run_id)
 
         total_rows_inserted_to_staging = records_inserted + records_rejected_saved_to_staging
 
@@ -6892,8 +7612,15 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
             "records_rejected": records_rejected,
             "records_rejected_saved_to_staging": records_rejected_saved_to_staging,
             "records_reactivated_in_curated": records_reactivated_in_curated,
+            "records_deactivated_from_rejected": records_deactivated_from_rejected,
             "save_rejected_to_staging": save_rejected_to_staging,
             "thematic_llm_enabled": use_llm,
+            "thematic_review_ai_enabled": use_thematic_review_ai,
+            "thematic_review_ai_requested_value": thematic_review_ai_value,
+            "thematic_review_ai_min_confidence": get_thematic_review_ai_min_confidence(),
+            "thematic_review_ai_call_delay_seconds": get_thematic_review_ai_call_delay_seconds(),
+            "thematic_review_ai_max_calls_per_run": get_thematic_review_ai_max_calls_per_run(),
+            "thematic_review_ai_calls_this_run": get_thematic_review_ai_calls_this_run(),
             "career_ambiguity_ai_enabled": use_career_ai,
             "career_ambiguity_ai_requested_value": career_ai_value,
             "career_ambiguity_ai_configured": is_thematic_llm_configured(),

@@ -394,6 +394,12 @@ def get_default_max_rows_per_run() -> int | None:
     return parse_positive_int(os.environ.get("SCOPUS_MAX_ROWS_PER_RUN"), "SCOPUS_MAX_ROWS_PER_RUN")
 
 
+def get_hard_max_rows_per_run() -> int:
+    """Run84: límite duro de seguridad; recomendación operativa = 40 filas."""
+    parsed = parse_positive_int(os.environ.get("SCOPUS_HARD_MAX_ROWS_PER_RUN", "40"), "SCOPUS_HARD_MAX_ROWS_PER_RUN")
+    return parsed or 40
+
+
 def resolve_save_rejected_enabled(request_value: str | None = None) -> bool:
     """
     Controla si los registros rechazados se guardan en stg.scopus_raw_load para auditoría.
@@ -7022,6 +7028,13 @@ def map_row_to_staging(
         if not mapped.get("area_idic_raw") and thematic.get("area_idic_raw"):
             mapped["area_idic_raw"] = thematic["area_idic_raw"]
 
+        # RUN84 FIX: copiar SIEMPRE la línea IDIC desde la clasificación temática.
+        # En run83 faltaba este bloque y, por eso, los registros válidos quedaban con
+        # linea_idic_raw = NULL; luego la validación del triplete anulaba también
+        # category_tematica_raw y area_idic_raw.
+        if not mapped.get("linea_idic_raw") and thematic.get("linea_idic_raw"):
+            mapped["linea_idic_raw"] = thematic["linea_idic_raw"]
+
         if thematic.get("thematic_review_rejected"):
             mapped["area_carrera_raw"] = thematic.get("area_carrera_raw")
             mapped["linea_carrera_raw"] = thematic.get("linea_carrera_raw")
@@ -7335,11 +7348,12 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
             "scopus_ingest_singleton_lock_enabled": get_ingest_singleton_lock_enabled(),
             "scopus_ingest_lock_timeout_ms": get_ingest_singleton_lock_timeout_ms(),
             "scopus_max_rows_per_run": get_default_max_rows_per_run(),
+            "scopus_hard_max_rows_per_run": get_hard_max_rows_per_run(),
             "save_rejected_to_staging_default": resolve_save_rejected_enabled(),
             "engineering_generic_inference_enabled": True,
             "engineering_generic_inference_min_score": CAREER_INFERENCE_MIN_SCORE,
             "engineering_generic_inference_min_margin": CAREER_INFERENCE_MIN_MARGIN,
-            "classification_guardrails_version": "v8_run83_docentes_ref_strong_thematic_rescue_patch",
+            "classification_guardrails_version": "v9_run84_clean_40_idic_restore_and_batch_guardrails",
             "post_upsert_reactivation_enabled": True,
             "post_upsert_deactivation_from_rejected_enabled": True,
         }
@@ -7522,6 +7536,23 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         end_row = parse_positive_int(get_request_value(req, request_payload, ["end_row", "endRow"]), "end_row")
         max_rows = parse_positive_int(get_request_value(req, request_payload, ["max_rows", "maxRows"]), "max_rows")
 
+        # RUN84: procesamiento controlado por lotes. Si no se define rango,
+        # se procesa automáticamente un máximo de 40 filas. Si se pide más,
+        # se detiene con error explícito.
+        hard_max_rows = get_hard_max_rows_per_run()
+        if max_rows is None and end_row is None:
+            max_rows = get_default_max_rows_per_run() or hard_max_rows
+        if max_rows is not None and max_rows > hard_max_rows:
+            raise ValueError(
+                f"max_rows={max_rows} exceeds SCOPUS_HARD_MAX_ROWS_PER_RUN={hard_max_rows}. "
+                "Process Scopus in controlled batches."
+            )
+        if start_row is not None and end_row is not None and (end_row - start_row + 1) > hard_max_rows:
+            raise ValueError(
+                f"Requested row range has {end_row - start_row + 1} rows, exceeding "
+                f"SCOPUS_HARD_MAX_ROWS_PER_RUN={hard_max_rows}."
+            )
+
         llm_value = get_request_value(req, request_payload, ["llm", "thematic_llm", "use_llm", "useLlm"])
         career_ai_value = get_request_value(
             req,
@@ -7569,6 +7600,32 @@ def run_ingest_scopus(req: func.HttpRequest) -> func.HttpResponse:
         )
 
         records_read = len(rows)
+
+        # RUN84: control RAW antes de clasificar. Si el CSV no trae afiliación o
+        # abstract, no se debe marcar todo como REJECT_NO_ULIMA_AFFILIATION; el
+        # archivo está incompleto para este pipeline.
+        if records_read > 0:
+            affiliation_missing = sum(
+                1
+                for r in rows
+                if not (safe_get(r, ["Authors with affiliations"]) or safe_get(r, ["Affiliations", "Afiliaciones"]))
+            )
+            abstract_missing = sum(
+                1
+                for r in rows
+                if not safe_get(r, ["Abstract Scopus", "Abstract", "Resumen"])
+            )
+            if affiliation_missing / records_read >= 0.80:
+                raise RuntimeError(
+                    "RAW_INCOMPLETE_HEADERS: more than 80% of selected rows have no "
+                    "Affiliations/Authors with affiliations. Re-export Scopus with full metadata."
+                )
+            if abstract_missing / records_read >= 0.80:
+                raise RuntimeError(
+                    "RAW_INCOMPLETE_HEADERS: more than 80% of selected rows have no Abstract. "
+                    "Re-export Scopus with full metadata."
+                )
+
         records_inserted, records_rejected, rejected_audit_rows = insert_rows_to_staging(
             run_id=run_id,
             source_file_name=blob_name,
